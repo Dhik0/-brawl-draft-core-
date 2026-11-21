@@ -1,0 +1,48 @@
+{
+  "_comment": "英雄定位标签配置。key 为角色标识，brawlers 为英雄英文名（与 Supercell API brawler.name 一致）。analyze 阶段会按名称解析出整数 ID 一并导出，前端可按 id 或 name 关联。",
+  "version": 1,
+  "roles": [
+    {
+      "key": "TANK",
+      "label": "坦克/前排",
+      "description": "高血量近战，负责开团、吃伤害与占点",
+      "brawlers": ["El Primo", "Bull", "Rosa", "Frank", "Darryl", "Jacky", "Bibi", "Ash", "Hank", "Sam", "Draco"]
+    },
+    {
+      "key": "DAMAGE",
+      "label": "脆皮输出",
+      "description": "远程持续或爆发输出，血薄，需要前排保护",
+      "brawlers": ["Colt", "Piper", "Brock", "Bea", "Belle", "Mandy", "Maisie", "Angelo", "8-Bit", "Penny", "Nani", "Lola", "Clancy", "Pearl"]
+    },
+    {
+      "key": "WALLBREAK",
+      "label": "破墙",
+      "description": "可摧毁墙体，破解投掷位与掩体阵型",
+      "brawlers": ["Bull", "Brock", "Griff", "Gale", "El Primo", "Darryl"]
+    },
+    {
+      "key": "THROWER",
+      "label": "投掷",
+      "description": "越墙投掷，压制掩体后的敌人，怕贴脸",
+      "brawlers": ["Barley", "Dynamike", "Tick", "Sprout", "Grom", "Larry & Laurie", "Juju"]
+    },
+    {
+      "key": "ASSASSIN",
+      "label": "刺客",
+      "description": "位移突进秒杀后排，克制脆皮输出与投掷",
+      "brawlers": ["Edgar", "Mortis", "Leon", "Crow", "Buzz", "Stu", "Lily", "Mico", "Kit", "Shade"]
+    },
+    {
+      "key": "CONTROL",
+      "label": "控场",
+      "description": "减速、拉人、封路等区域控制，主导地图节奏",
+      "brawlers": ["Tara", "Gene", "Emz", "Sandy", "Gale", "Lou", "Otis", "Charlie", "Buster"]
+    },
+    {
+      "key": "SUPPORT",
+      "label": "治疗/辅助",
+      "description": "治疗、护盾与增益，提升阵容续航",
+      "brawlers": ["Poco", "Pam", "Byron", "Gus", "Ruffs", "Berry"]
+    }
+  ]
+}
