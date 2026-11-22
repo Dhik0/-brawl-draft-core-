@@ -125,7 +125,9 @@ impl Crawler {
             match joined {
                 Ok((tag, Ok(Some(log)))) => {
                     report.fetched += 1;
-                    for item in &log.items {
+                    // battlelog 是「最新在前」，倒序处理让最后写入的 players.tier
+                    // 来自该玩家最新的一场对局（set_player_tier 是覆盖写）
+                    for item in log.items.iter().rev() {
                         match db.ingest_battle(item, &tag, filter)? {
                             IngestOutcome::Inserted(_) => report.inserted += 1,
                             IngestOutcome::Duplicate => report.duplicates += 1,

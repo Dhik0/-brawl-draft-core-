@@ -47,7 +47,11 @@ CREATE INDEX IF NOT EXISTS idx_battles_map ON battles (map_name);
 /// 入库过滤参数。
 #[derive(Debug, Clone, Copy)]
 pub struct IngestFilter {
+    /// 对局 6 人平均段位下限（1~22，16 = 传奇 I）。
     pub min_tier: i64,
+    /// 雪球扩充时新玩家的入队门槛（1~22，15 = 神话 III）。
+    /// 低于该段位的玩家不会被加入抓取队列，避免队列被低分段稀释。
+    pub min_enqueue_tier: i64,
     pub season_start: DateTime<Utc>,
 }
 
@@ -55,6 +59,7 @@ impl From<&Config> for IngestFilter {
     fn from(cfg: &Config) -> Self {
         Self {
             min_tier: cfg.min_tier,
+            min_enqueue_tier: cfg.min_enqueue_tier,
             season_start: cfg.season_start,
         }
     }
@@ -187,21 +192,26 @@ impl Db {
         Ok(inserted)
     }
 
-    /// 更新玩家段位（取较大值，避免被低质量数据覆盖）。
+    /// 更新玩家最新排位段位（覆盖写：段位会升降，保留历史最高会让队列失真）。
+    ///
+    /// **只更新已在队列中的玩家**，不新建行——否则任何被解析出段位的玩家都会
+    /// 悄悄混进抓取队列，`min_enqueue_tier` 的门槛就形同虚设。
     pub fn set_player_tier(&mut self, tag: &str, tier: i64) -> Result<()> {
         let tag = normalize_tag(tag);
         self.conn.execute(
-            "INSERT INTO players (tag, tier, last_crawled_at) VALUES (?1, ?2, 0)
-             ON CONFLICT(tag) DO UPDATE SET tier = MAX(players.tier, excluded.tier)",
+            "UPDATE players SET tier = ?2 WHERE tag = ?1",
             params![tag, tier],
         )?;
         Ok(())
     }
 
     /// 按 `last_crawled_at` 最早优先取出待抓取玩家。
+    ///
+    /// 段位已知的玩家优先（`tier DESC`）：队列里混着大量 0 段位的待确认玩家时，
+    /// 先把已确认的高分段抓完，雪球才不会被低分段稀释。
     pub fn next_crawl_batch(&self, limit: usize) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
-            "SELECT tag FROM players ORDER BY last_crawled_at ASC, tag ASC LIMIT ?1",
+            "SELECT tag FROM players ORDER BY tier DESC, last_crawled_at ASC, tag ASC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], |row| row.get::<_, String>(0))?;
         let mut out = Vec::new();
@@ -258,7 +268,7 @@ impl Db {
             return Ok(IngestOutcome::Filtered(FilterReason::BeforeSeason));
         }
 
-        let avg_tier = item.average_rank().unwrap_or(0);
+        let avg_tier = item.average_tier().unwrap_or(0);
         if avg_tier > 0 && avg_tier < filter.min_tier {
             return Ok(IngestOutcome::Filtered(FilterReason::BelowTier));
         }
@@ -301,6 +311,10 @@ impl Db {
         let mut tags: Vec<String> = Vec::with_capacity(6);
         let mut brawler_names: Vec<(i64, String)> = Vec::new();
         let mut team_ids: Vec<Vec<i64>> = Vec::with_capacity(2);
+        // 本局解析出的玩家段位，用于回写 players.tier
+        let mut tier_updates: Vec<(String, i64)> = Vec::with_capacity(6);
+        // 只有达到入队门槛的玩家才进入雪球队列
+        let mut to_enqueue: Vec<String> = Vec::with_capacity(6);
 
         for team in teams {
             let mut ids = Vec::with_capacity(team.len());
@@ -311,6 +325,12 @@ impl Db {
                 let tag = normalize_tag(&p.tag);
                 if tag.is_empty() {
                     return Ok(IngestOutcome::Filtered(FilterReason::Malformed("player_tag")));
+                }
+                if let Some(tier) = crate::models::api::ranked_tier_of(p) {
+                    if tier >= filter.min_enqueue_tier {
+                        to_enqueue.push(tag.clone());
+                    }
+                    tier_updates.push((tag.clone(), tier));
                 }
                 tags.push(tag);
                 ids.push(p.brawler.id);
@@ -340,10 +360,17 @@ impl Db {
 
         if self.insert_battle(&row)? {
             self.upsert_brawler_names(&brawler_names)?;
-            self.enqueue_players(tags.iter().map(String::as_str))?;
+            // 先入队再写段位：set_player_tier 只更新已入队的玩家，
+            // 这样未达门槛的玩家不会因为「被解析出段位」而混进队列
+            self.enqueue_players(to_enqueue.iter().map(String::as_str))?;
+            for (tag, tier) in &tier_updates {
+                self.set_player_tier(tag, *tier)?;
+            }
             debug!(
                 map = %row.map_name,
                 hash = %row.battle_hash,
+                tier = avg_tier,
+                enqueued = to_enqueue.len(),
                 "对局入库"
             );
             Ok(IngestOutcome::Inserted(tags))
@@ -524,24 +551,26 @@ mod tests {
 
     fn filter() -> IngestFilter {
         IngestFilter {
-            min_tier: 20,
+            min_tier: 16,
+            min_enqueue_tier: 15,
             season_start: DateTime::parse_from_rfc3339("2026-09-01T00:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
         }
     }
 
-    fn player(tag: &str, brawler_id: i64, rank: i64) -> BattlePlayer {
+    /// 构造一名玩家：`tier` 走排位 battlelog 的 `brawler.trophies` 字段（1~22）。
+    fn player(tag: &str, brawler_id: i64, tier: i64) -> BattlePlayer {
         BattlePlayer {
             tag: tag.to_string(),
             name: Some(format!("P{tag}")),
-            rank: Some(rank),
+            rank: None,
             brawler: Brawler {
                 id: brawler_id,
                 name: Some(format!("B{brawler_id}")),
                 power: Some(11),
-                trophies: Some(900),
-                rank: Some(rank),
+                trophies: Some(tier),
+                rank: None,
             },
         }
     }
@@ -563,12 +592,12 @@ mod tests {
                     team_a
                         .iter()
                         .enumerate()
-                        .map(|(i, t)| player(t, 16000000 + i as i64, 25))
+                        .map(|(i, t)| player(t, 16000000 + i as i64, 18))
                         .collect(),
                     team_b
                         .iter()
                         .enumerate()
-                        .map(|(i, t)| player(t, 16000010 + i as i64, 25))
+                        .map(|(i, t)| player(t, 16000010 + i as i64, 18))
                         .collect(),
                 ]),
                 ..Default::default()
@@ -689,12 +718,11 @@ mod tests {
             IngestOutcome::Filtered(FilterReason::BeforeSeason)
         );
 
-        // 低段位
+        // 低段位（钻石 I = 10 < 传奇 I = 16）
         let mut low = battle_item("20261012T101112.000Z", ["#A1", "#A2", "#A3"], ["#B1", "#B2", "#B3"], true);
         for team in low.battle.teams.as_mut().unwrap() {
             for p in team {
-                p.rank = Some(10);
-                p.brawler.rank = Some(10);
+                p.brawler.trophies = Some(10);
             }
         }
         assert_eq!(
@@ -716,6 +744,62 @@ mod tests {
         assert_eq!(stats.players, 6, "6 名玩家都应进入抓取队列");
         assert_eq!(stats.pending_players, 6);
         assert_eq!(db.brawler_dict().unwrap().len(), 6);
+    }
+
+    #[test]
+    fn only_high_tier_players_are_enqueued() {
+        let mut db = Db::open_in_memory().unwrap();
+        let f = filter();
+        // 段位：18 / 15 / 9 / 22 / 14 / 16
+        let tiers = [18, 15, 9, 22, 14, 16];
+        let mut item = battle_item(
+            "20261012T101112.000Z",
+            ["#A1", "#A2", "#A3"],
+            ["#B1", "#B2", "#B3"],
+            true,
+        );
+        let mut i = 0;
+        for team in item.battle.teams.as_mut().unwrap() {
+            for p in team {
+                p.brawler.trophies = Some(tiers[i]);
+                i += 1;
+            }
+        }
+        db.ingest_battle(&item, "#A1", &f).unwrap();
+
+        // 只有 >= 15 的 4 名玩家进入队列（18 / 15 / 22 / 16）
+        assert_eq!(db.stats().unwrap().players, 4);
+        let mut queued: Vec<String> = db.next_crawl_batch(10).unwrap();
+        queued.sort();
+        assert_eq!(queued, vec!["#A1", "#A2", "#B1", "#B3"]);
+    }
+
+    #[test]
+    fn crawl_queue_prefers_higher_tier() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.enqueue_players(["#LOW", "#MID", "#HIGH"]).unwrap();
+        db.set_player_tier("#LOW", 5).unwrap();
+        db.set_player_tier("#MID", 15).unwrap();
+        db.set_player_tier("#HIGH", 22).unwrap();
+
+        assert_eq!(
+            db.next_crawl_batch(3).unwrap(),
+            vec!["#HIGH".to_string(), "#MID".to_string(), "#LOW".to_string()]
+        );
+    }
+
+    #[test]
+    fn player_tier_is_overwritten_not_maxed() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.enqueue_players(["#A"]).unwrap();
+        db.set_player_tier("#A", 21).unwrap();
+        // 段位会掉，覆盖写才反映「最新」
+        db.set_player_tier("#A", 17).unwrap();
+        let tier: i64 = db
+            .connection()
+            .query_row("SELECT tier FROM players WHERE tag = '#A'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tier, 17);
     }
 
     #[test]

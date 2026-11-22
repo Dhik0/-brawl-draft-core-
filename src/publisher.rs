@@ -105,20 +105,33 @@ mod tests {
     use super::*;
     use crate::models::output::{
         AnalysisParams, BrawlerRef, MapBrawlerStat, MapMeta, Matchup, ModeBrawlerStat, ModeMeta,
-        PickOrder, RolesConfig,
+        PickOrder, RolesConfig, TierAudit, TierBucket,
     };
 
     fn sample_meta() -> MetaOutput {
         MetaOutput {
-            schema_version: 2,
+            schema_version: 3,
             updated_at: "2026-11-21T00:00:00Z".to_string(),
             season_start: "2026-07-20".to_string(),
             total_battles: 42,
             min_tier: 20,
+            tier_audit: TierAudit {
+                min_tier: 16,
+                battles_total: 42,
+                battles_kept: 42,
+                unknown_tier_battles: 0,
+                distribution: vec![TierBucket {
+                    tier: 18,
+                    label: "传奇 III".to_string(),
+                    battles: 42,
+                }],
+            },
             params: AnalysisParams {
                 bayes_prior_weight: 50.0,
-                matchup_prior_weight: 6.0,
+                matchup_smoothing_c: 15.0,
                 matchup_min_samples: 6,
+                map_matchup_min_samples: 5,
+                map_matchup_trust_samples: 15,
                 decay_half_life_days: 30.0,
             },
             brawlers: vec![
@@ -145,6 +158,11 @@ mod tests {
                     use_rate: 1.0,
                     score: 100.0,
                     pick_order: PickOrder::First,
+                    matchups: vec![Matchup {
+                        opponent: 16_000_001,
+                        delta: 14.48,
+                        samples: 18,
+                    }],
                 }],
             }],
             modes: vec![ModeMeta {
@@ -159,10 +177,9 @@ mod tests {
                     smoothed_wr: 0.5435,
                     use_rate: 1.0,
                     matchups: vec![Matchup {
-                        opponent_id: 16_000_001,
-                        games: 8,
-                        win_rate: 0.625,
-                        smoothed_wr: 0.5714,
+                        opponent: 16_000_001,
+                        delta: 14.48,
+                        samples: 18,
                     }],
                 }],
             }],

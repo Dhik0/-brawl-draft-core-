@@ -198,9 +198,8 @@ fn cmd_analyze(cfg: &Config, pretty: bool) -> Result<()> {
     let roles = RolesConfig::load(&cfg.roles_path)?;
     let opts = AnalyzeOptions {
         bayes_prior_weight: cfg.bayes_prior_weight,
-        matchup_prior_weight: analyzer::DEFAULT_MATCHUP_PRIOR_WEIGHT,
+        matchup_smoothing_c: analyzer::DEFAULT_MATCHUP_SMOOTHING_C,
         matchup_min_samples: cfg.matchup_min_samples,
-        decay_half_life_days: analyzer::DEFAULT_DECAY_HALF_LIFE_DAYS,
         min_tier: cfg.min_tier,
         season_start: cfg.season_start_raw.clone(),
         roles,
@@ -208,6 +207,8 @@ fn cmd_analyze(cfg: &Config, pretty: bool) -> Result<()> {
 
     let meta = analyze(&battles, &db.brawler_dict()?, &opts);
     let report = publisher::write_meta(&cfg.dist_path, &meta, pretty)?;
+
+    print_tier_audit(&meta);
 
     println!(
         "分析完成：{} 场对局 / {} 张地图 / {} 个模式 / {} 名英雄 -> {} ({:.1} KB)",
@@ -219,12 +220,28 @@ fn cmd_analyze(cfg: &Config, pretty: bool) -> Result<()> {
         report.bytes as f64 / 1024.0
     );
 
-    // 顺位分布：分位分配后应接近 FIRST 22% / LAST 22% / MIDDLE 56%
+    // 单图平均样本量：低于 500 说明过滤口径过严，导出的是稀疏数据
+    let avg_per_map = if meta.maps.is_empty() {
+        0.0
+    } else {
+        meta.maps.iter().map(|m| m.total_games).sum::<u64>() as f64 / meta.maps.len() as f64
+    };
+    println!(
+        "单图平均样本：{:.0} 局（{} 张地图，最少 {} 局）",
+        avg_per_map,
+        meta.maps.len(),
+        meta.maps.iter().map(|m| m.total_games).min().unwrap_or(0)
+    );
+
+    // 顺位分布：只在**合格英雄**里统计（极冷门英雄不参与分位划分）
     let mut first = 0usize;
     let mut middle = 0usize;
     let mut last = 0usize;
     for map in &meta.maps {
         for b in &map.brawlers {
+            if !analyzer::is_ranked_pick_candidate(b) {
+                continue;
+            }
             match b.pick_order {
                 PickOrder::First => first += 1,
                 PickOrder::Middle => middle += 1,
@@ -235,7 +252,8 @@ fn cmd_analyze(cfg: &Config, pretty: bool) -> Result<()> {
     let total = first + middle + last;
     if total > 0 {
         println!(
-            "顺位分布：FIRST {} ({:.1}%) / MIDDLE {} ({:.1}%) / LAST {} ({:.1}%)",
+            "顺位分布（合格英雄 {} 名）：FIRST {} ({:.1}%) / MIDDLE {} ({:.1}%) / LAST {} ({:.1}%)",
+            total,
             first,
             first as f64 * 100.0 / total as f64,
             middle,
@@ -261,6 +279,68 @@ fn cmd_analyze(cfg: &Config, pretty: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// 打印段位分布与过滤结果。
+///
+/// 按「青铜 / 白银 / 黄金 / 钻石 / 神话 / 传奇 / 大师 / 职业」分组汇总，
+/// 再附一行逐段位明细——用于确认 `brawler.trophies` 的解析口径是否正确。
+fn print_tier_audit(meta: &brawl_draft_core::models::output::MetaOutput) {
+    use brawl_draft_core::models::output::{tier_group, tier_label};
+
+    let audit = &meta.tier_audit;
+    println!(
+        "段位门槛 MIN_TIER={}（{}）：过滤前 {} 局 / 过滤后 {} 局（段位未知 {} 局）",
+        audit.min_tier,
+        tier_label(audit.min_tier),
+        audit.battles_total,
+        audit.battles_kept,
+        audit.unknown_tier_battles
+    );
+
+    let total = audit.battles_total.max(1) as f64;
+    for group in [
+        "青铜", "白银", "黄金", "钻石", "神话", "传奇", "大师", "职业", "未知",
+    ] {
+        let battles: u64 = audit
+            .distribution
+            .iter()
+            .filter(|b| tier_group(b.tier) == group)
+            .map(|b| b.battles)
+            .sum();
+        if battles == 0 {
+            continue;
+        }
+        println!(
+            "  {:<4} {:>8} 局  ({:>5.1}%)",
+            group,
+            battles,
+            battles as f64 * 100.0 / total
+        );
+    }
+
+    // 逐段位明细（降序），最多 22 行
+    let mut detail: Vec<&brawl_draft_core::models::output::TierBucket> = audit
+        .distribution
+        .iter()
+        .filter(|b| b.battles > 0)
+        .collect();
+    detail.sort_by(|a, b| b.tier.cmp(&a.tier));
+    if !detail.is_empty() {
+        let line: Vec<String> = detail
+            .iter()
+            .map(|b| format!("{}={}", b.label, b.battles))
+            .collect();
+        println!("  明细：{}", line.join("  "));
+    }
+
+    if !audit.filter_effective() {
+        println!(
+            "  ⚠ 段位门槛无从判定：{} 局段位字段不可解析（期望 brawler.trophies 落在 1..=22），\
+             实际统计的是全部分段",
+            audit.unknown_tier_battles
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

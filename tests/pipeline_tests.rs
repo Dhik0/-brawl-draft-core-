@@ -11,7 +11,8 @@ use std::path::Path;
 
 fn filter() -> IngestFilter {
     IngestFilter {
-        min_tier: 20,
+        min_tier: 16,
+        min_enqueue_tier: 15,
         season_start: DateTime::parse_from_rfc3339("2026-09-01T00:00:00Z")
             .unwrap()
             .with_timezone(&Utc),
@@ -22,13 +23,14 @@ fn mk_player(tag: &str, brawler_id: i64) -> BattlePlayer {
     BattlePlayer {
         tag: tag.to_string(),
         name: Some(format!("name{tag}")),
-        rank: Some(28),
+        rank: None,
         brawler: Brawler {
             id: brawler_id,
             name: Some(format!("Brawler{brawler_id}")),
             power: Some(11),
-            trophies: Some(800),
-            rank: Some(28),
+            // 排位 battlelog 的 trophies 字段即段位整数（1~22）
+            trophies: Some(18),
+            rank: None,
         },
     }
 }
@@ -152,10 +154,9 @@ fn mock_then_analyze_produces_valid_meta() {
 
     let opts = AnalyzeOptions {
         bayes_prior_weight: 50.0,
-        matchup_prior_weight: 6.0,
+        matchup_smoothing_c: 15.0,
         matchup_min_samples: 6,
-        decay_half_life_days: 30.0,
-        min_tier: 20,
+        min_tier: 16,
         season_start: "2026-07-20".into(),
         roles,
     };
@@ -187,6 +188,20 @@ fn mock_then_analyze_produces_valid_meta() {
             assert!((0.0..=1.0).contains(&b.use_rate));
             assert!((0.0..=1.0).contains(&b.win_rate));
             assert!((0.0..=1.0).contains(&b.smoothed_wr));
+            // 地图级克制：2 位小数、样本达阈值、无自我对位
+            for m in &b.matchups {
+                assert!(m.samples >= 5, "地图级对位低于阈值的必须被剔除");
+                assert_ne!(m.opponent, b.id, "不应出现自我对位");
+                assert_eq!(m.delta, (m.delta * 100.0).round() / 100.0, "delta 应为 2 位小数");
+            }
+            assert!(
+                b.matchups.len() <= 16,
+                "地图级克制每侧最多 8 条，共 16 条"
+            );
+            assert!(
+                b.matchups.windows(2).all(|w| w[0].delta >= w[1].delta),
+                "地图级克制必须按 delta 降序"
+            );
         }
     }
 
@@ -201,13 +216,31 @@ fn mock_then_analyze_produces_valid_meta() {
                 with_matchups += 1;
             }
             for m in &b.matchups {
-                assert!(m.games >= 6, "低于阈值的对位必须被剔除");
-                assert!((0.0..=1.0).contains(&m.win_rate));
-                assert!((0.0..=1.0).contains(&m.smoothed_wr));
-                assert_ne!(m.opponent_id, b.id, "不应出现自我对位");
+                assert!(m.samples >= 6, "低于阈值的对位必须被剔除");
+                assert_ne!(m.opponent, b.id, "不应出现自我对位");
+            }
+            assert!(b.matchups.len() <= 12, "模式级克制最多导出 12 条");
+        }
+    }
+
+    // 克制关系严格反对称：A 对 B 的 delta 必须等于 B 对 A 的相反数
+    let mut checked = 0usize;
+    for mode in &out.modes {
+        for b in &mode.brawlers {
+            for m in &b.matchups {
+                if let Some(rev) = mode
+                    .brawlers
+                    .iter()
+                    .find(|x| x.id == m.opponent)
+                    .and_then(|x| x.matchups.iter().find(|y| y.opponent == b.id))
+                {
+                    assert_eq!(rev.delta, -m.delta, "模式级 delta 必须严格反对称");
+                    checked += 1;
+                }
             }
         }
     }
+    assert!(checked > 0, "应至少校验到一组双向对位");
     let coverage = with_matchups as f64 / total_mode_brawlers as f64;
     assert!(
         coverage > 0.5,
@@ -216,29 +249,51 @@ fn mock_then_analyze_produces_valid_meta() {
     );
 
     // ---- 顺位分布 ----
+    //
+    // 只有样本充足的英雄参与 FIRST / LAST 分位划分，所以占比要对**合格英雄**算，
+    // 而不是全部条目。极冷门英雄（本图 20 场以下）必须留在 MIDDLE。
     let mut first = 0usize;
     let mut last = 0usize;
-    let mut all = 0usize;
+    let mut qualified = 0usize;
     for map in &out.maps {
         for b in &map.brawlers {
-            all += 1;
+            // 与 analyzer 的顺位门槛共用同一实现，避免规则漂移
+            let is_qualified = brawl_draft_core::analyzer::is_ranked_pick_candidate(b);
+            if is_qualified {
+                qualified += 1;
+            }
             match b.pick_order {
-                PickOrder::First => first += 1,
-                PickOrder::Last => last += 1,
+                PickOrder::First => {
+                    first += 1;
+                    assert!(
+                        is_qualified,
+                        "{} 样本不足（{} 场）却被标成 FIRST",
+                        b.name, b.games
+                    );
+                }
+                PickOrder::Last => {
+                    last += 1;
+                    assert!(
+                        is_qualified,
+                        "{} 样本不足（{} 场）却被标成 LAST",
+                        b.name, b.games
+                    );
+                }
                 PickOrder::Middle => {}
             }
         }
     }
-    let first_ratio = first as f64 / all as f64;
-    let last_ratio = last as f64 / all as f64;
+    assert!(qualified > 0, "应存在合格英雄");
+    let first_ratio = first as f64 / qualified as f64;
+    let last_ratio = last as f64 / qualified as f64;
     assert!(
         (0.18..=0.26).contains(&first_ratio),
-        "FIRST 占比应约 22%，实际 {:.1}%",
+        "合格英雄中 FIRST 占比应约 22%，实际 {:.1}%",
         first_ratio * 100.0
     );
     assert!(
         last_ratio <= 0.26,
-        "LAST 占比不应超过 26%，实际 {:.1}%",
+        "合格英雄中 LAST 占比不应超过 26%，实际 {:.1}%",
         last_ratio * 100.0
     );
 

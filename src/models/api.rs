@@ -13,6 +13,11 @@ pub const RANKED_BATTLE_TYPES: [&str; 2] = ["soloRanked", "teamRanked"];
 /// 非排位（需要显式剔除）的 `battle.type` 取值。
 pub const NON_RANKED_BATTLE_TYPES: [&str; 3] = ["friendly", "challenge", "practice"];
 
+/// 排位段位下界：1 = 青铜 I。
+pub const MIN_RANKED_TIER: i64 = 1;
+/// 排位段位上界：22 = 职业（Pro）。
+pub const MAX_RANKED_TIER: i64 = 22;
+
 // ---------------------------------------------------------------------------
 // /rankings/global/players
 // ---------------------------------------------------------------------------
@@ -162,22 +167,52 @@ impl BattleItem {
             .collect()
     }
 
-    /// 6 名玩家段位（rank）的平均值；缺数据返回 `None`。
-    pub fn average_rank(&self) -> Option<i64> {
-        let ranks: Vec<i64> = self
-            .battle
+    /// 该局每名玩家的排位段位 `(tag, tier)`；解析失败的玩家被跳过。
+    ///
+    /// 排位 battlelog 里 `brawler.trophies` 存的**不是**英雄奖杯数，而是官方直接下发的
+    /// 排位段位整数（1~22）。范围校验是区分两者的关键：普通对局的真实奖杯是成百上千，
+    /// 会被 `1..=22` 天然挡掉。
+    pub fn player_tiers(&self) -> Vec<(String, i64)> {
+        self.battle
             .teams
             .iter()
             .flatten()
             .flatten()
-            .filter_map(|p| p.brawler.rank.or(p.rank))
-            .collect();
-        if ranks.is_empty() {
+            .filter_map(|p| {
+                let tag = p.tag.trim();
+                if tag.is_empty() {
+                    return None;
+                }
+                ranked_tier_of(p).map(|tier| (tag.to_string(), tier))
+            })
+            .collect()
+    }
+
+    /// 6 名玩家的平均排位段位；全员段位不可解析时返回 `None`。
+    ///
+    /// 取整方式为四舍五入（而非截断），避免 15.6 被记成 15 后跨过门槛。
+    pub fn average_tier(&self) -> Option<i64> {
+        let tiers = self.player_tiers();
+        if tiers.is_empty() {
             return None;
         }
-        let sum: i64 = ranks.iter().sum();
-        Some(sum / ranks.len() as i64)
+        let sum: i64 = tiers.iter().map(|(_, t)| *t).sum();
+        let count = tiers.len() as i64;
+        Some((sum + count / 2) / count)
     }
+}
+
+/// 解析单个玩家的排位段位（1~22）。
+///
+/// 主字段是 `brawler.trophies`（排位赛里它是段位整数）；缺失或越界时
+/// 再回退到 `brawler.rank` / `player.rank`，同样要求落在 `1..=22`。
+pub fn ranked_tier_of(p: &BattlePlayer) -> Option<i64> {
+    let valid = |v: &i64| (MIN_RANKED_TIER..=MAX_RANKED_TIER).contains(v);
+    p.brawler
+        .trophies
+        .filter(valid)
+        .or_else(|| p.brawler.rank.filter(valid))
+        .or_else(|| p.rank.filter(valid))
 }
 
 /// 对局事件信息。
@@ -275,14 +310,14 @@ mod tests {
             "rank": 1,
             "teams": [
               [
-                { "tag": "#AAA", "name": "A", "brawler": { "id": 16000000, "name": "Shelly", "power": 11, "trophies": 900, "rank": 25 } },
-                { "tag": "#BBB", "name": "B", "brawler": { "id": 16000001, "name": "Colt" } },
-                { "tag": "#CCC", "name": "C", "brawler": { "id": 16000002 } }
+                { "tag": "#AAA", "name": "A", "brawler": { "id": 16000000, "name": "Shelly", "power": 11, "trophies": 18 } },
+                { "tag": "#BBB", "name": "B", "brawler": { "id": 16000001, "name": "Colt", "trophies": 16 } },
+                { "tag": "#CCC", "name": "C", "brawler": { "id": 16000002, "trophies": 20 } }
               ],
               [
-                { "tag": "#DDD", "name": "D", "brawler": { "id": 16000003, "name": "Bull" } },
+                { "tag": "#DDD", "name": "D", "brawler": { "id": 16000003, "name": "Bull", "trophies": 900 } },
                 { "tag": "#EEE", "name": "E", "brawler": { "id": 16000004, "name": "Primo" } },
-                { "tag": "#FFF", "name": "F", "brawler": { "id": 16000005, "name": "Barley" } }
+                { "tag": "#FFF", "name": "F", "brawler": { "id": 16000005, "name": "Barley", "trophies": 0 } }
               ]
             ]
           }
@@ -334,9 +369,53 @@ mod tests {
     }
 
     #[test]
-    fn average_rank_uses_available_ranks() {
+    fn trophies_is_parsed_as_ranked_tier() {
         let log: BattleLog = serde_json::from_str(SAMPLE).unwrap();
-        // 只有一名玩家带 rank=25
-        assert_eq!(log.items[0].average_rank(), Some(25));
+        let tiers = log.items[0].player_tiers();
+        // 18 / 16 / 20 有效；900（真实奖杯）、缺失、0 全部被范围校验挡掉
+        assert_eq!(
+            tiers,
+            vec![
+                ("#AAA".to_string(), 18),
+                ("#BBB".to_string(), 16),
+                ("#CCC".to_string(), 20),
+            ]
+        );
+    }
+
+    #[test]
+    fn average_tier_ignores_out_of_range_values() {
+        let log: BattleLog = serde_json::from_str(SAMPLE).unwrap();
+        // (18 + 16 + 20) / 3 = 18
+        assert_eq!(log.items[0].average_tier(), Some(18));
+    }
+
+    #[test]
+    fn average_tier_is_none_without_valid_tiers() {
+        let mut log: BattleLog = serde_json::from_str(SAMPLE).unwrap();
+        for team in log.items[0].battle.teams.as_mut().unwrap() {
+            for p in team {
+                p.brawler.trophies = Some(900); // 普通对局的真实奖杯数
+                p.brawler.rank = None;
+                p.rank = None;
+            }
+        }
+        assert_eq!(log.items[0].average_tier(), None, "奖杯数不能冒充段位");
+    }
+
+    #[test]
+    fn average_tier_rounds_half_up() {
+        let mut log: BattleLog = serde_json::from_str(SAMPLE).unwrap();
+        let teams = log.items[0].battle.teams.as_mut().unwrap();
+        // 15,15,16,15,16,16 -> 93/6 = 15.5 -> 16（截断会得到 15，跨不过 Legendary I）
+        let vals = [15, 15, 16, 15, 16, 16];
+        let mut i = 0;
+        for team in teams {
+            for p in team {
+                p.brawler.trophies = Some(vals[i]);
+                i += 1;
+            }
+        }
+        assert_eq!(log.items[0].average_tier(), Some(16));
     }
 }

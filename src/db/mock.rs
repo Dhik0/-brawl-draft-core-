@@ -133,12 +133,14 @@ pub fn generate(
     // ---- 玩家池 ----
     let mut pool: Vec<(String, i64)> = Vec::with_capacity(PLAYER_POOL);
     for _ in 0..PLAYER_POOL {
-        // 段位 20~35：刚好覆盖默认 MIN_TIER=20 的边界
-        let rank = 20 + rng.below(16) as i64;
-        pool.push((random_tag(&mut rng), rank));
+        // 排位段位 16~22（传奇 I ~ 职业）：与 MIN_TIER=16 的口径一致，
+        // 保证模拟数据走的是「高分段」统计路径
+        let tier = 16 + rng.below(7) as i64;
+        pool.push((random_tag(&mut rng), tier));
     }
-    for (tag, rank) in &pool {
-        db.set_player_tier(tag, *rank)?;
+    for (tag, tier) in &pool {
+        db.enqueue_players([tag.as_str()])?;
+        db.set_player_tier(tag, *tier)?;
     }
     summary.players = pool.len();
 
@@ -213,13 +215,14 @@ pub fn generate(
                         BattlePlayer {
                             tag: p.0.clone(),
                             name: Some(format!("Player{}", &p.0[1..5])),
-                            rank: Some(p.1),
+                            rank: None,
                             brawler: Brawler {
                                 id: brawler_id(roster_idx),
                                 name: Some(ROSTER[roster_idx].to_string()),
                                 power: Some(11),
-                                trophies: Some(600 + p.1 * 40),
-                                rank: Some(p.1),
+                                // 排位 battlelog 里 trophies 存的是段位整数（1~22）
+                                trophies: Some(p.1),
+                                rank: None,
                             },
                         }
                     })
@@ -302,7 +305,8 @@ mod tests {
 
     fn filter() -> IngestFilter {
         IngestFilter {
-            min_tier: 20,
+            min_tier: 16,
+            min_enqueue_tier: 15,
             season_start: chrono::DateTime::parse_from_rfc3339("2026-09-01T00:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),

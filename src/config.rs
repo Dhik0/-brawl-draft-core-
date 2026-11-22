@@ -39,8 +39,10 @@ pub struct Config {
     pub season_start: DateTime<Utc>,
     /// 赛季起始日期的原始字符串，用于写入导出元数据。
     pub season_start_raw: String,
-    /// 段位阈值（对局 6 人平均 rank）。
+    /// 段位阈值（对局 6 人平均排位段位，1~22）。默认 16 = 传奇 I。
     pub min_tier: i64,
+    /// 雪球扩充的入队门槛（1~22）。默认 15 = 神话 III。
+    pub min_enqueue_tier: i64,
     /// 贝叶斯平滑先验权重 m。
     pub bayes_prior_weight: f64,
     /// 1v1 克制矩阵最小交锋样本量。
@@ -75,7 +77,8 @@ impl Config {
             max_retries: env_parse("CRAWL_MAX_RETRIES", 3u32)?,
             season_start,
             season_start_raw,
-            min_tier: env_parse("MIN_TIER", 20i64)?,
+            min_tier: env_parse("MIN_TIER", 16i64)?,
+            min_enqueue_tier: env_parse("ENQUEUE_MIN_TIER", 15i64)?,
             bayes_prior_weight: env_parse("BAYES_PRIOR_WEIGHT", 50.0f64)?,
             matchup_min_samples: env_parse("MATCHUP_MIN_SAMPLES", 6u32)?,
             database_path: PathBuf::from(env_or("DATABASE_PATH", "brawl.db")),
@@ -159,7 +162,8 @@ impl Config {
             max_retries: 3,
             season_start: parse_season_start("2026-09-01").expect("固定日期必然合法"),
             season_start_raw: "2026-09-01".to_string(),
-            min_tier: 20,
+            min_tier: 16,
+            min_enqueue_tier: 15,
             bayes_prior_weight: 50.0,
             matchup_min_samples: 6,
             database_path: PathBuf::from("brawl.db"),
