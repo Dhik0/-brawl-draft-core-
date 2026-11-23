@@ -31,6 +31,11 @@ pub struct Config {
     pub api_base_url: String,
     /// 单轮抓取最多处理的玩家数。
     pub crawl_limit: usize,
+    /// 已抓取玩家的重新排队间隔（小时）。0 表示下一轮就可以重抓。
+    ///
+    /// 没有这个窗口时，只要「玩家总数 < 单轮 limit」，每轮都会重扫同一批人，
+    /// 重复率会接近 100%。
+    pub crawl_refresh_hours: i64,
     /// 异步并发上限。
     pub concurrency: usize,
     /// 429 / 5xx 的最大重试次数。
@@ -77,6 +82,7 @@ impl Config {
             proxy_url: env_opt("PROXY_URL"),
             api_base_url: resolve_api_base_url(env_opt("BRAWL_API_BASE_URL").as_deref()),
             crawl_limit: env_parse("CRAWL_LIMIT", 200usize)?,
+            crawl_refresh_hours: env_parse("CRAWL_REFRESH_HOURS", 6i64)?,
             concurrency: env_parse("CRAWL_CONCURRENCY", 10usize)?.max(1),
             max_retries: env_parse("CRAWL_MAX_RETRIES", 3u32)?,
             season_start,
@@ -162,6 +168,7 @@ impl Config {
             proxy_url: None,
             api_base_url: DEFAULT_API_BASE_URL.to_string(),
             crawl_limit: 200,
+            crawl_refresh_hours: 6,
             concurrency: 10,
             max_retries: 3,
             season_start: parse_season_start("2026-09-01").expect("固定日期必然合法"),

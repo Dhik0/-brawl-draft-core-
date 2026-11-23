@@ -126,6 +126,8 @@ fn cmd_crawl(cfg: &Config, limit: usize, seed: bool, seed_limit: usize) -> Resul
 
     let runtime = tokio::runtime::Runtime::new().context("创建 Tokio 运行时失败")?;
     let mut db = Db::open(&cfg.database_path)?;
+    // 已抓取玩家的重新排队间隔：0 表示每轮都可重抓
+    db.set_crawl_refresh_secs(cfg.crawl_refresh_hours.saturating_mul(3600));
     let filter = IngestFilter::from(cfg);
 
     runtime.block_on(async {
@@ -136,17 +138,24 @@ fn cmd_crawl(cfg: &Config, limit: usize, seed: bool, seed_limit: usize) -> Resul
         let report = crawler.crawl_once(&mut db, limit, &filter).await?;
         let stats = db.stats()?;
         println!(
-            "抓取完成：请求 {} / 成功 {} / 新对局 {} / 重复 {} / 过滤 {} / 失败 {}",
+            "抓取完成：请求 {} / 成功 {} / 不存在 {} / 被拒 {} / 新对局 {} / 重复 {} / 过滤 {} / 失败 {}",
             report.requested,
             report.fetched,
+            report.not_found,
+            report.rejected,
             report.inserted,
             report.duplicates,
             report.filtered,
             report.failed
         );
         println!(
-            "库内合计：{} 场对局 / {} 张地图 / {} 名玩家（待抓取 {}）",
-            stats.battles, stats.maps, stats.players, stats.pending_players
+            "库内合计：{} 场对局 / {} 张地图 / {} 名玩家（从未抓取 {} / 本轮可抓 {} / 刷新间隔 {}h）",
+            stats.battles,
+            stats.maps,
+            stats.players,
+            stats.pending_players,
+            stats.due_players,
+            cfg.crawl_refresh_hours
         );
         Ok::<(), anyhow::Error>(())
     })

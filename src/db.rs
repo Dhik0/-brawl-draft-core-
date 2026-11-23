@@ -115,11 +115,21 @@ pub enum IngestOutcome {
     Filtered(FilterReason),
 }
 
+/// 已抓取玩家的默认刷新间隔：6 小时。
+///
+/// 队列里的玩家被抓过之后不会立刻回到队头，必须等这个窗口过去才会重新排队。
+/// 没有这个窗口时，只要「玩家总数 < 单轮 limit」，每轮都会重扫同一批人，
+/// 重复率会接近 100%。
+pub const DEFAULT_CRAWL_REFRESH_SECS: i64 = 6 * 3600;
+
 /// 数据库统计信息。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DbStats {
     pub players: i64,
+    /// 从未成功抓取过（`last_crawled_at = 0`）的玩家数。
     pub pending_players: i64,
+    /// 本轮真正可抓取的数量：从未抓取，或距上次抓取已超过刷新间隔。
+    pub due_players: i64,
     pub battles: i64,
     pub maps: i64,
 }
@@ -127,6 +137,8 @@ pub struct DbStats {
 /// SQLite 连接封装。
 pub struct Db {
     conn: Connection,
+    /// 已抓取玩家重新排队的间隔（秒），见 [`DEFAULT_CRAWL_REFRESH_SECS`]。
+    crawl_refresh_secs: i64,
 }
 
 impl Db {
@@ -158,7 +170,20 @@ impl Db {
         conn.busy_timeout(Duration::from_secs(5))
             .context("设置 busy_timeout 失败")?;
         conn.execute_batch(SCHEMA).context("初始化表结构失败")?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            crawl_refresh_secs: DEFAULT_CRAWL_REFRESH_SECS,
+        })
+    }
+
+    /// 调整「已抓取玩家重新排队」的间隔（秒）。传 0 表示下一轮就可以重抓。
+    pub fn set_crawl_refresh_secs(&mut self, secs: i64) {
+        self.crawl_refresh_secs = secs.max(0);
+    }
+
+    /// 当前的重新排队间隔（秒）。
+    pub fn crawl_refresh_secs(&self) -> i64 {
+        self.crawl_refresh_secs
     }
 
     /// 直接访问底层连接（测试用）。
@@ -205,15 +230,30 @@ impl Db {
         Ok(())
     }
 
-    /// 按 `last_crawled_at` 最早优先取出待抓取玩家。
+    /// 按「最该抓」的顺序取出本轮玩家。
     ///
-    /// 段位已知的玩家优先（`tier DESC`）：队列里混着大量 0 段位的待确认玩家时，
-    /// 先把已确认的高分段抓完，雪球才不会被低分段稀释。
+    /// 排序键第一位**必须是** `last_crawled_at`：从未抓取（值为 0）的最先，然后按
+    /// 上次抓取时间从旧到新；段位只用于同时间戳内部的次序（`tier DESC`）。
+    ///
+    /// 一旦把 `tier` 放在首位（旧实现就是 `ORDER BY tier DESC, last_crawled_at ASC`），
+    /// 高段位玩家会**永久**占住队头：他们被抓完后时间戳只是变大，`tier` 依旧最高，
+    /// 于是每轮都重新拉取同一批人（含 404 死号），新入队的 0 段位玩家永远轮不到，
+    /// `待抓取` 自然也不会下降。
+    ///
+    /// 只有「从未抓取」或「距上次抓取已超过刷新间隔」的玩家才会入队；整个队列都在
+    /// 刷新窗口内时返回空，由调用方决定是等待还是先 seed。
     pub fn next_crawl_batch(&self, limit: usize) -> Result<Vec<String>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let cutoff = Utc::now().timestamp() - self.crawl_refresh_secs;
         let mut stmt = self.conn.prepare(
-            "SELECT tag FROM players ORDER BY tier DESC, last_crawled_at ASC, tag ASC LIMIT ?1",
+            "SELECT tag FROM players
+              WHERE last_crawled_at = 0 OR last_crawled_at <= ?2
+              ORDER BY last_crawled_at ASC, tier DESC, tag ASC
+              LIMIT ?1",
         )?;
-        let rows = stmt.query_map(params![limit as i64], |row| row.get::<_, String>(0))?;
+        let rows = stmt.query_map(params![limit as i64, cutoff], |row| row.get::<_, String>(0))?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -222,12 +262,28 @@ impl Db {
     }
 
     /// 标记玩家最近一次抓取时间（Unix 秒）。
+    ///
+    /// 单条 UPDATE，语句级原子。**所有拿到 HTTP 响应的结局都必须调用它**——
+    /// 2xx（含 battlelog 为空、全被过滤、全重复）、404 不存在、4xx 被拒都算
+    /// 「这个 Tag 已经问过了」；只有超时 / 429 / 5xx 这类临时失败才保留待重试。
+    ///
+    /// 精确匹配失败时按大小写兜底再试一次：历史版本可能写入过非规范 Tag，
+    /// 若这里静默更新 0 行，该玩家就会永远留在队头被反复拉取。
     pub fn mark_crawled(&mut self, tag: &str, ts: i64) -> Result<()> {
         let tag = normalize_tag(tag);
-        self.conn.execute(
+        let mut changed = self.conn.execute(
             "UPDATE players SET last_crawled_at = ?2 WHERE tag = ?1",
             params![tag, ts],
         )?;
+        if changed == 0 {
+            changed = self.conn.execute(
+                "UPDATE players SET last_crawled_at = ?2 WHERE UPPER(tag) = UPPER(?1)",
+                params![tag, ts],
+            )?;
+        }
+        if changed == 0 {
+            warn!(tag = %tag, "玩家不在抓取队列中，时间戳未写入");
+        }
         Ok(())
     }
 
@@ -448,14 +504,27 @@ impl Db {
     }
 
     /// 统计信息。
+    ///
+    /// `pending_players` 与 `due_players` 刻意分开：
+    /// * `pending_players` = 从未抓取过（`last_crawled_at = 0`），
+    ///   每轮抓完必须真实下降，否则说明状态没写回去；
+    /// * `due_players` = 与 [`Self::next_crawl_batch`] 完全相同的口径，
+    ///   用于判断「本轮到底还有没有人可抓」。
     pub fn stats(&self) -> Result<DbStats> {
+        let cutoff = Utc::now().timestamp() - self.crawl_refresh_secs;
         let count = |sql: &str| -> Result<i64> {
             let v: i64 = self.conn.query_row(sql, [], |r| r.get(0))?;
             Ok(v)
         };
+        let due_players: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM players WHERE last_crawled_at = 0 OR last_crawled_at <= ?1",
+            params![cutoff],
+            |r| r.get(0),
+        )?;
         Ok(DbStats {
             players: count("SELECT COUNT(*) FROM players")?,
             pending_players: count("SELECT COUNT(*) FROM players WHERE last_crawled_at = 0")?,
+            due_players,
             battles: count("SELECT COUNT(*) FROM battles")?,
             maps: count("SELECT COUNT(DISTINCT map_name) FROM battles")?,
         })
@@ -811,5 +880,118 @@ mod tests {
 
         let batch = db.next_crawl_batch(2).unwrap();
         assert_eq!(batch, vec!["#C".to_string(), "#B".to_string()]);
+    }
+
+    /// 回归用例：高段位玩家抓过之后不能继续占住队头。
+    ///
+    /// 旧实现 `ORDER BY tier DESC, last_crawled_at ASC` 会让 tier=22 的玩家
+    /// 每轮都排第一，即使刚刚抓过——这正是「每轮重复拉取同一批 Tag、
+    /// `待抓取` 不下降」的根因。
+    #[test]
+    fn high_tier_crawled_player_does_not_block_fresh_player() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.enqueue_players(["#PRO", "#NEW"]).unwrap();
+        db.set_player_tier("#PRO", 22).unwrap();
+        db.mark_crawled("#PRO", Utc::now().timestamp()).unwrap();
+
+        assert_eq!(
+            db.next_crawl_batch(10).unwrap(),
+            vec!["#NEW".to_string()],
+            "刚抓过的高段位玩家必须让位给从未抓取的新玩家"
+        );
+    }
+
+    /// 刷新窗口内的玩家不应该被重复拉取（队列规模小于单轮 limit 时的重复来源）。
+    #[test]
+    fn crawled_players_are_not_requeued_within_refresh_window() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.enqueue_players(["#A", "#B"]).unwrap();
+        let now = Utc::now().timestamp();
+        db.mark_crawled("#A", now).unwrap();
+        db.mark_crawled("#B", now).unwrap();
+
+        assert!(
+            db.next_crawl_batch(10).unwrap().is_empty(),
+            "全部玩家都在刷新窗口内时不应返回任何 Tag"
+        );
+        assert_eq!(db.stats().unwrap().due_players, 0);
+    }
+
+    /// 刷新窗口过去之后，最久没抓的玩家重新排队（保证长跑循环能持续刷新数据）。
+    #[test]
+    fn stale_players_are_requeued_after_refresh_window() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.enqueue_players(["#FRESH", "#OLD", "#OLDER"]).unwrap();
+        let now = Utc::now().timestamp();
+        db.mark_crawled("#FRESH", now - 60).unwrap();
+        db.mark_crawled("#OLD", now - 7 * 3600).unwrap();
+        db.mark_crawled("#OLDER", now - 9 * 3600).unwrap();
+
+        assert_eq!(
+            db.next_crawl_batch(10).unwrap(),
+            vec!["#OLDER".to_string(), "#OLD".to_string()],
+            "只有超过刷新间隔（默认 6h）的玩家才会回来，且更旧的优先"
+        );
+
+        // 间隔调成 0 后三者都到期，仍然按最久未抓优先
+        db.set_crawl_refresh_secs(0);
+        assert_eq!(
+            db.next_crawl_batch(10).unwrap(),
+            vec!["#OLDER".to_string(), "#OLD".to_string(), "#FRESH".to_string()]
+        );
+    }
+
+    /// `待抓取` 口径必须真实反映「还没问过的 Tag」，抓完要下降。
+    #[test]
+    fn pending_stat_drops_after_marking() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.enqueue_players(["#A", "#B", "#C"]).unwrap();
+
+        let before = db.stats().unwrap();
+        assert_eq!((before.pending_players, before.due_players), (3, 3));
+
+        db.mark_crawled("#A", Utc::now().timestamp()).unwrap();
+        let after = db.stats().unwrap();
+        assert_eq!(after.pending_players, 2, "抓过的玩家不再计入待抓取");
+        assert_eq!(after.due_players, 2, "刷新窗口内也不再计入本轮可抓");
+        assert_eq!(after.players, 3, "总数不变");
+    }
+
+    /// 404 死号同样会被标记，因此不会在下一轮继续排在最前面。
+    #[test]
+    fn dead_tag_leaves_the_queue_head_after_marking() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.enqueue_players(["#DEAD", "#ALIVE"]).unwrap();
+        db.set_player_tier("#DEAD", 22).unwrap();
+
+        // 第一轮：死号段位最高，排第一
+        assert_eq!(db.next_crawl_batch(1).unwrap(), vec!["#DEAD".to_string()]);
+        // 404 之后必须标记
+        db.mark_crawled("#DEAD", Utc::now().timestamp()).unwrap();
+        // 第二轮：轮到另一个玩家，而不是再问一次死号
+        assert_eq!(db.next_crawl_batch(1).unwrap(), vec!["#ALIVE".to_string()]);
+    }
+
+    /// 历史数据里可能存在非规范大小写的 Tag，标记必须照样生效。
+    #[test]
+    fn mark_crawled_tolerates_legacy_tag_casing() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO players (tag, tier, last_crawled_at) VALUES ('#legacyTag', 0, 0)",
+                [],
+            )
+            .unwrap();
+
+        db.mark_crawled("#LEGACYTAG", 1_700_000_000).unwrap();
+        let ts: i64 = db
+            .connection()
+            .query_row(
+                "SELECT last_crawled_at FROM players WHERE tag = '#legacyTag'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ts, 1_700_000_000, "大小写不一致也要能写回时间戳");
     }
 }
