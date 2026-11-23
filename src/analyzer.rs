@@ -1,39 +1,67 @@
-//! 离线分析引擎：加权胜率、贝叶斯平滑、Log5 残差克制矩阵与选人顺位。
+//! 离线分析引擎：加权胜率、贝叶斯平滑、地图分层去偏的 Log5 克制残差与选人顺位。
 //!
 //! ## 两级聚合
 //!
 //! * **地图维度**（`maps[]`）：出场率、平滑胜率、综合评分、选人顺位，以及
-//!   **地图级克制列表**。同一英雄在不同地形下（草图 vs 开阔图）克制关系差异很大，
-//!   因此地图层是克制结论的首选来源。
-//! * **模式维度**（`modes[]`）：同模式下各图的克制关系高度一致，按模式聚合能把
-//!   样本放大数倍，作为地图样本不足时的**先验**。
+//!   **地图级克制列表**。地形差异（草图 vs 开阔图）直接体现在这一层，
+//!   是克制结论的首选来源。
+//! * **模式维度**（`modes[]`）：同一模式的地图共享地形族特征，按模式汇总后
+//!   样本量放大数倍，作为单图样本不足时的**先验**；全库（Global）再往上一层，
+//!   作为跨模式的最后兜底。
 //!
-//! ## 克制算法：Log5 预期胜率残差 + 贝叶斯平滑
+//! ## 克制算法：地图分层去偏 + 互斥分层平滑
 //!
 //! 直接用「A 打 B 的原始胜率」当克制分是错的：强势英雄对谁都能赢，会被误判成
-//! 「克制所有人」。正确做法是先扣掉双方的基础强度：
+//! 「克制所有人」。正确做法是先扣掉双方**在该图上的基础强度**：
 //!
 //! ```text
-//! p_A    = clamp((wins_A + m/2) / (games_A + m), 0.05, 0.95)   // 平滑基础胜率
-//! E_AB   = p_A(1-p_B) / (p_A(1-p_B) + (1-p_A)p_B)              // Log5 预期对位胜率
-//! delta  = (w_AB - n_AB * E_AB) / (n_AB + C) * 100             // 净胜率差值（pp）
+//! p_a     = clamp((wins_a + m/2) / (games_a + m), 0.05, 0.95)   // 该图基础胜率
+//! E_ab,m  = p_a(1-p_b) / (p_a(1-p_b) + (1-p_a)p_b)              // 该图 Log5 预期胜率
+//! e_ab,m  = w_ab,m - n_ab,m * E_ab,m                            // 该图超额胜场
 //! ```
 //!
-//! * `C` 是平滑常数（伪场次，建议 15~20），小样本的残差被压向 0；
-//! * 因为 `E_BA = 1 - E_AB` 且 `w_BA = n - w_AB`，所以 `delta_BA = -delta_AB` 严格成立。
+//! ### 为什么必须按图分层
 //!
-//! ### 层级兜底：地图优先，模式先验
+//! 如果先把各图的 `n` / `w` 加起来、再用「跨图混合的胜率」对照「跨图混合的
+//! 预期」，就会踩辛普森悖论：两张图的出场结构不同（一张图对手偏弱、一张图
+//! 对手偏强），混合后的残差会被地形差异污染，甚至把「只在开阔图强」的英雄
+//! 判成「在草图被克制」。
 //!
-//! 单图对位样本往往很薄。地图层用「留一图」的模式残差做先验，并按样本量连续收缩：
+//! 本实现**每张图各自用自己的 `p_a` 算 `E`，再对超额胜场 `e` 求和**：`e` 已经
+//! 扣掉了该图的基础强度，可以直接相加，这就是模式层 / 全库层的汇总口径。
+//!
+//! ### 互斥分层：本图 / 同模式其他图 / 其他模式
+//!
+//! 单图对位样本往往很薄，需要借外部样本做先验；但三组数据必须**互不重叠**，
+//! 否则同一批对局会被重复计数：
 //!
 //! ```text
-//! prior_pp  = (w_mode_other - n_mode_other * E_mode) / (n_mode_other + C) * 100
-//! prior_w   = C * max(0, 1 - n_map / TRUST)          // TRUST 场后完全信任单图
-//! delta_map = (w_map - n_map*E_map + prior_w*prior_pp/100) / (n_map + C) * 100
+//! 本图         n1 = n(A,B,m)             e1 = e(A,B,m)
+//! 同模式其他图  n2 = N_mode - n1          e2 = E_mode - e1
+//! 其他模式      n3 = N_global - N_mode    e3 = E_global - E_mode
 //! ```
 //!
-//! `n_map >= TRUST` 时 `prior_w = 0`，退化为纯单图估计；`n_map = 0` 时完全等于模式先验。
-//! 收缩权重随样本量连续衰减，避免在阈值附近出现跳变。
+//! 外部样本按权重折算并封顶，避免其他模式的海量样本淹没本图的大样本：
+//!
+//! ```text
+//! n2_eff = min(0.6 * n2, 40)   e2_eff = e2 * (n2_eff / n2)
+//! n3_eff = min(0.3 * n3, 25)   e3_eff = e3 * (n3_eff / n3)
+//! eff_n  = n1 + n2_eff + n3_eff
+//! delta  = (e1 + e2_eff + e3_eff) / (eff_n + K)        // K = 50 伪场次
+//! ```
+//!
+//! `delta` 是**概率残差**（`0.03` 表示 3 个百分点）。导出时乘以 100 记作
+//! 百分点，与 v3 字段口径保持一致。
+//!
+//! 严格反对称：`E_ba = 1 - E_ab` 且 `e_ba = -e_ab`；三层的 `e` 都按规范方向
+//! （`lo < hi`）算一次再镜像，因此 `delta(A,B,m) == -delta(B,A,m)` 精确成立。
+//!
+//! ### 过滤与兜底
+//!
+//! 只导出 `eff_n >= 15` 且 `|delta| >= 0.02` 的条目，其余视为噪音（10 场 6 胜
+//! 这类小样本残差约 1.7pp，会被拦掉）。**后端不做任何「正残差过大就抹零」的
+//! 处理**：真实克制关系原样保留，绿灯绝对胜率由前端展示层结合本图基础胜率
+//! 自行兜底。
 //!
 //! ## 综合评分（`score`）
 //!
@@ -68,8 +96,9 @@
 //!
 //! ## 并行策略
 //!
-//! 先用 HashMap 按地图 / 模式分组（单线程 O(n)），再用 `rayon` 对**每张地图**、
-//! **每个模式**并行聚合。
+//! 先按地图分组（单线程 O(n)），再用 `rayon` 并行计算每张图的原始聚合与超额
+//! 胜场；模式 / 全库的汇总必须串行（需要全部地图的结果），之后地图维度的
+//! 导出再次并行。
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -109,14 +138,26 @@ const PICK_MIN_USE_SHARE: f64 = 0.005;
 /// 参与分位划分的最小有效对位边数。
 const PICK_MIN_EDGES: usize = 3;
 
-/// 克制残差贝叶斯平滑的默认常数 C（伪场次）。
-pub const DEFAULT_MATCHUP_SMOOTHING_C: f64 = 15.0;
+/// 分层贝叶斯收缩的先验强度 K（伪场次）。
+///
+/// 与旧版 `C = 15` 的差别：`delta` 现在已经是概率残差（未乘 100），
+/// `K = 50` 相当于「本图 50 场伪样本」，比旧口径更保守，能压住 10 场 6 胜这类噪音。
+pub const MATCHUP_PRIOR_K: f64 = 50.0;
+/// 同模式其他地图的样本折算权重。
+pub const SAME_MODE_SAMPLE_WEIGHT: f64 = 0.6;
+/// 同模式其他地图折算后的样本上限（防止外部大样本压过本图）。
+pub const SAME_MODE_SAMPLE_CAP: f64 = 40.0;
+/// 其他模式的样本折算权重。
+pub const OTHER_MODE_SAMPLE_WEIGHT: f64 = 0.3;
+/// 其他模式折算后的样本上限。
+pub const OTHER_MODE_SAMPLE_CAP: f64 = 25.0;
+/// 导出克制条目的最小有效样本 `eff_n`。
+pub const MIN_MATCHUP_EFF_SAMPLES: f64 = 15.0;
+/// 导出克制条目的最小残差绝对值（概率单位，`0.02` = 2pp）。
+pub const MIN_MATCHUP_ABS_DELTA: f64 = 0.02;
+
 /// 时间衰减的默认半衰期（天）。
 pub const DEFAULT_DECAY_HALF_LIFE_DAYS: f64 = 30.0;
-/// 地图级克制导出的最小原始对位场次。
-pub const DEFAULT_MAP_MATCHUP_MIN_SAMPLES: u32 = 5;
-/// 地图级对位达到该场次后完全信任单图数据。
-pub const DEFAULT_MAP_MATCHUP_TRUST_SAMPLES: u32 = 15;
 
 /// 基础胜率的截断区间，防止 Log5 除零与极端值。
 const BASE_RATE_FLOOR: f64 = 0.05;
@@ -142,15 +183,18 @@ const FLEX_MAX_PENALTY_PP: f64 = 20.0;
 /// 计算「波动」至少需要的对位条数，单条对位不构成波动。
 const MIN_MATCHUPS_FOR_PROFILE: usize = 2;
 
+/// 规范方向的对位键：`(lo, hi)` 且 `lo < hi`。
+type PairKey = (i64, i64);
+/// 模式层对位键：模式索引 + 规范方向的对位键。
+type ModePairKey = (usize, i64, i64);
+
 /// 分析参数。
 #[derive(Debug, Clone)]
 pub struct AnalyzeOptions {
     /// 胜率贝叶斯平滑的先验权重 m。
     pub bayes_prior_weight: f64,
-    /// 克制残差贝叶斯平滑常数 C（伪场次）。
-    pub matchup_smoothing_c: f64,
-    /// 模式级克制导出的最小原始对位场次。
-    pub matchup_min_samples: u32,
+    /// 分层收缩的先验强度 K（伪场次）。
+    pub matchup_prior_k: f64,
     /// 段位阈值：仅保留 `avg_tier >= min_tier` 的对局（`avg_tier <= 0` 视为未知，保留）。
     pub min_tier: i64,
     /// 赛季起始日期字符串（回显）。
@@ -174,42 +218,47 @@ pub fn analyze(
 
     let weighted = weigh_battles(&kept, DEFAULT_DECAY_HALF_LIFE_DAYS);
 
-    // 1) 按地图 / 模式分组（一次遍历，两边共用同一份权重）
+    // 1) 按地图分组（一次遍历，权重只算一次）
     let mut by_map: HashMap<&str, Vec<(&BattleRow, f64)>> = HashMap::new();
-    let mut by_mode: HashMap<&str, Vec<(&BattleRow, f64)>> = HashMap::new();
     for (row, weight) in &weighted {
         by_map
             .entry(row.map_name.as_str())
             .or_default()
             .push((*row, *weight));
-        by_mode
-            .entry(row.mode.as_str())
-            .or_default()
-            .push((*row, *weight));
     }
 
-    // 2) 模式维度并行聚合（克制矩阵 + 地图层的先验）
-    let mut built: Vec<(ModeMeta, ModeContext)> = by_mode
+    // 2) 每张图各自的原始聚合 + 该图基础胜率 + 超额胜场（并行）
+    let mut cores: Vec<MapCore> = by_map
         .par_iter()
-        .map(|(mode, rows)| build_mode(mode, rows, brawler_dict, opts))
+        .map(|(map_name, rows)| build_map_core(map_name, rows, opts))
         .collect();
-    built.sort_by(|a, b| {
-        b.0.total_games
-            .cmp(&a.0.total_games)
-            .then_with(|| a.0.mode.cmp(&b.0.mode))
+    cores.sort_by(|a, b| {
+        b.total_games
+            .cmp(&a.total_games)
+            .then_with(|| a.map_name.cmp(&b.map_name))
     });
 
-    let contexts: HashMap<&str, &ModeContext> =
-        built.iter().map(|(m, c)| (m.mode.as_str(), c)).collect();
-
-    // 3) 地图维度并行聚合（评分 + 顺位 + 地图级克制）
+    // 3) 模式 / 全库的超额胜场汇总。
     //
-    // 顺位判定用的是**本图**的对位画像，不再复用模式级结果：同一英雄在草图与
-    // 开阔图上的克制差异很大，拿模式级最差对位去评一张开阔图，会被无关地形的
-    // 近战克制污染（例如狙击图上的投掷手被按「撞脸坦克」扣分）。
-    let mut maps: Vec<MapMeta> = by_map
+    // 必须串行：这一步要看到全部地图的结果。汇总的是 `e`（已扣掉各图基础强度），
+    // 不是重新用混合胜率算一次 Log5——见模块文档「为什么必须按图分层」。
+    let mut mode_index: HashMap<&str, usize> = HashMap::new();
+    let mut mode_names: Vec<&str> = Vec::new();
+    for core in &cores {
+        if !mode_index.contains_key(core.mode.as_str()) {
+            mode_index.insert(core.mode.as_str(), mode_names.len());
+            mode_names.push(core.mode.as_str());
+        }
+    }
+    let (mode_excess, global_excess) = aggregate_excess(&cores, &mode_index);
+
+    // 4) 地图维度并行导出（评分 + 顺位 + 地图级克制）
+    let mut maps: Vec<MapMeta> = cores
         .par_iter()
-        .map(|(map_name, rows)| build_map(map_name, rows, &contexts, brawler_dict, opts))
+        .map(|core| {
+            let idx = mode_index[core.mode.as_str()];
+            build_map(core, idx, &mode_excess, &global_excess, brawler_dict, opts)
+        })
         .collect();
     maps.sort_by(|a, b| {
         b.total_games
@@ -217,7 +266,31 @@ pub fn analyze(
             .then_with(|| a.map_name.cmp(&b.map_name))
     });
 
-    let modes: Vec<ModeMeta> = built.into_iter().map(|(m, _)| m).collect();
+    // 5) 模式维度导出
+    let mut modes: Vec<ModeMeta> = mode_names
+        .iter()
+        .enumerate()
+        .map(|(idx, mode)| {
+            let group: Vec<&MapCore> = cores
+                .iter()
+                .filter(|c| mode_index[c.mode.as_str()] == idx)
+                .collect();
+            build_mode(
+                mode,
+                idx,
+                &group,
+                &mode_excess,
+                &global_excess,
+                brawler_dict,
+                opts,
+            )
+        })
+        .collect();
+    modes.sort_by(|a, b| {
+        b.total_games
+            .cmp(&a.total_games)
+            .then_with(|| a.mode.cmp(&b.mode))
+    });
 
     MetaOutput {
         schema_version: SCHEMA_VERSION,
@@ -228,11 +301,18 @@ pub fn analyze(
         tier_audit,
         params: AnalysisParams {
             bayes_prior_weight: opts.bayes_prior_weight,
-            matchup_smoothing_c: opts.matchup_smoothing_c,
-            matchup_min_samples: opts.matchup_min_samples,
-            map_matchup_min_samples: DEFAULT_MAP_MATCHUP_MIN_SAMPLES,
-            map_matchup_trust_samples: DEFAULT_MAP_MATCHUP_TRUST_SAMPLES,
+            // 旧字段名沿用：语义已统一为分层收缩强度 K
+            matchup_smoothing_c: opts.matchup_prior_k,
+            matchup_min_samples: MIN_MATCHUP_EFF_SAMPLES as u32,
+            map_matchup_min_samples: MIN_MATCHUP_EFF_SAMPLES as u32,
+            map_matchup_trust_samples: MIN_MATCHUP_EFF_SAMPLES as u32,
             decay_half_life_days: DEFAULT_DECAY_HALF_LIFE_DAYS,
+            matchup_min_eff_samples: MIN_MATCHUP_EFF_SAMPLES,
+            matchup_min_abs_delta: MIN_MATCHUP_ABS_DELTA,
+            same_mode_weight: SAME_MODE_SAMPLE_WEIGHT,
+            same_mode_cap: SAME_MODE_SAMPLE_CAP,
+            other_mode_weight: OTHER_MODE_SAMPLE_WEIGHT,
+            other_mode_cap: OTHER_MODE_SAMPLE_CAP,
         },
         brawlers: build_brawler_refs(&kept, brawler_dict),
         maps,
@@ -347,6 +427,14 @@ impl Accum {
             self.raw_wins += 1;
         }
     }
+
+    /// 合并另一份累加结果（用于把多张地图合成一个模式）。
+    fn merge(&mut self, other: &Accum) {
+        self.games += other.games;
+        self.wins += other.wins;
+        self.raw_games += other.raw_games;
+        self.raw_wins += other.raw_wins;
+    }
 }
 
 /// 两两对位的原始计数。
@@ -367,6 +455,21 @@ impl PairStat {
     fn add_loss(&mut self) {
         self.n += 1;
     }
+
+    fn merge(&mut self, other: &PairStat) {
+        self.n += other.n;
+        self.w += other.w;
+    }
+}
+
+/// 某一层（本图 / 同模式 / 全库）的超额胜场累计。
+///
+/// `e` 是**超额胜场**（真实胜场 - Log5 预期胜场），不是胜率差值：
+/// 各图的地形结构不同，但 `e` 已经扣掉了各自的基础强度，可以直接相加。
+#[derive(Debug, Default, Clone, Copy)]
+struct Stratum {
+    n: f64,
+    e: f64,
 }
 
 /// 模式内某个英雄的对位画像（单位均为百分点）。
@@ -378,19 +481,22 @@ struct MatchupProfile {
     spread_pp: f64,
 }
 
-/// 模式级的克制上下文：给地图层做「留一图」先验。
-///
-/// 只保留先验需要的两样东西——平滑基础胜率与两两原始计数；
-/// 模式级的 delta 矩阵在 `build_mode` 内部算完直接用于导出，不再驻留。
-struct ModeContext {
-    /// 平滑基础胜率（已截断到 `[0.05, 0.95]`）。
-    base: HashMap<i64, f64>,
-    /// 两两对位原始计数（双向各一条，保证 `w_ab + w_ba = n`）。
-    pairs: HashMap<(i64, i64), PairStat>,
+/// 单张地图的中间聚合结果（模式 / 全库汇总与导出都要用）。
+struct MapCore {
+    map_name: String,
+    /// 该图的主模式（同图多模式时取样本最多的一个）。
+    mode: String,
+    total_games: u64,
+    total_weight: f64,
+    acc: HashMap<i64, Accum>,
+    /// 有向对位原始计数（双向各一条，保证 `w_ab + w_ba = n`）。
+    pairs: HashMap<PairKey, PairStat>,
+    /// 规范方向（`lo < hi`）的超额胜场，`e` 属于 `lo` 对 `hi`。
+    excess: HashMap<PairKey, Stratum>,
 }
 
 // ---------------------------------------------------------------------------
-// Log5 数学
+// Log5 数学 + 分层平滑
 // ---------------------------------------------------------------------------
 
 /// 基础胜率截断，防止 Log5 除零与 0/1 极端值。
@@ -413,55 +519,64 @@ pub fn log5(p_a: f64, p_b: f64) -> f64 {
     }
 }
 
-/// 贝叶斯平滑后的净胜率差值（pp）。
+/// 外部样本的折算：按权重缩小并封顶，`e` 按同一比例缩放。
 ///
-/// `delta = (w - n*E) / (n + C) * 100`：分子是真实胜场与预期胜场之差，
-/// 分母加 `C` 个伪场次，把小样本残差压向 0。
-pub fn residual_delta(wins: u64, games: u64, expected: f64, c: f64) -> f64 {
-    if games == 0 {
-        return 0.0;
+/// 缩放比例作用在**超额胜场**上（而不是只改分母），这样外部样本的「证据强度」
+/// 与它贡献的 `eff_n` 始终一致，不会出现「样本被砍掉一半但残差全额保留」。
+fn discount_samples(n: f64, e: f64, weight: f64, cap: f64) -> (f64, f64) {
+    if n <= 0.0 {
+        return (0.0, 0.0);
     }
-    let n = games as f64;
-    ((wins as f64 - n * expected) / (n + c)) * 100.0
+    let n_eff = (weight * n).min(cap);
+    (n_eff, e * (n_eff / n))
 }
 
-/// 地图级 delta：单图残差 + 模式先验的连续收缩。
-fn map_delta(
-    games: u64,
-    wins: u64,
-    expected_map: f64,
-    prior_pp: f64,
-    c: f64,
-    trust: f64,
-) -> f64 {
-    let n = games as f64;
-    let resid = wins as f64 - n * expected_map;
-    // 样本越多越信任单图；达到 trust 后先验权重归零，与纯单图公式连续衔接。
-    let prior_w = c * (1.0 - n / trust).max(0.0);
-    ((resid + prior_w * prior_pp / 100.0) / (n + c)) * 100.0
+/// 互斥分层贝叶斯平滑：把本图 / 同模式其他图 / 其他模式的超额胜场合并成一个残差。
+///
+/// * `n1` / `e1`：本图场次与超额胜场；
+/// * `n2` / `e2`：同模式其他地图（**已扣除本图**，不重复计数）；
+/// * `n3` / `e3`：其他模式（**已扣除本模式**，不重复计数）。
+///
+/// 返回 `(delta, eff_n)`：`delta` 是概率残差（未乘 100），`eff_n` 是折算后的
+/// 有效样本量，用于导出过滤。
+pub fn hierarchical_delta(
+    n1: f64,
+    e1: f64,
+    n2: f64,
+    e2: f64,
+    n3: f64,
+    e3: f64,
+) -> (f64, f64) {
+    let (n2_eff, e2_eff) = discount_samples(n2, e2, SAME_MODE_SAMPLE_WEIGHT, SAME_MODE_SAMPLE_CAP);
+    let (n3_eff, e3_eff) = discount_samples(n3, e3, OTHER_MODE_SAMPLE_WEIGHT, OTHER_MODE_SAMPLE_CAP);
+    let eff_n = n1 + n2_eff + n3_eff;
+    let delta = (e1 + e2_eff + e3_eff) / (eff_n + MATCHUP_PRIOR_K);
+    (delta, eff_n)
+}
+
+/// 导出门槛：有效样本够、且残差足够显著。
+fn passes_export_filter(delta: f64, eff_n: f64) -> bool {
+    eff_n >= MIN_MATCHUP_EFF_SAMPLES && delta.abs() >= MIN_MATCHUP_ABS_DELTA
 }
 
 // ---------------------------------------------------------------------------
-// 模式维度
+// 地图层的原始聚合
 // ---------------------------------------------------------------------------
 
-fn build_mode(
-    mode: &str,
-    rows: &[(&BattleRow, f64)],
-    dict: &HashMap<i64, String>,
-    opts: &AnalyzeOptions,
-) -> (ModeMeta, ModeContext) {
+/// 单张地图的原始聚合：基础胜率、两两计数、逐图超额胜场。
+fn build_map_core(map_name: &str, rows: &[(&BattleRow, f64)], opts: &AnalyzeOptions) -> MapCore {
     let total_weight: f64 = rows.iter().map(|(_, w)| *w).sum();
     let mut acc: HashMap<i64, Accum> = HashMap::new();
-    let mut pairs: HashMap<(i64, i64), PairStat> = HashMap::new();
+    let mut pairs: HashMap<PairKey, PairStat> = HashMap::new();
+    let mut mode_votes: HashMap<&str, u64> = HashMap::new();
 
     for (row, weight) in rows {
-        let w = *weight;
+        *mode_votes.entry(row.mode.as_str()).or_insert(0) += 1;
         for b in &row.winners {
-            acc.entry(*b).or_default().add_appearance(w, true);
+            acc.entry(*b).or_default().add_appearance(*weight, true);
         }
         for b in &row.losers {
-            acc.entry(*b).or_default().add_appearance(w, false);
+            acc.entry(*b).or_default().add_appearance(*weight, false);
         }
         for a in &row.winners {
             for b in &row.losers {
@@ -474,7 +589,13 @@ fn build_mode(
         }
     }
 
-    let c = opts.matchup_smoothing_c.max(0.0);
+    let mode = mode_votes
+        .into_iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(a.0)))
+        .map(|(m, _)| m.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    // 该图的基础胜率 P(a, m)：平滑后钳制到 [0.05, 0.95]，供本图 Log5 使用。
     let base: HashMap<i64, f64> = acc
         .iter()
         .map(|(id, a)| {
@@ -487,31 +608,227 @@ fn build_mode(
         })
         .collect();
 
-    // 只按 (min, max) 方向算一次再镜像，保证 delta_BA == -delta_AB 精确成立
-    let mut delta: HashMap<(i64, i64), f64> = HashMap::with_capacity(pairs.len());
+    // 逐图超额胜场：只算规范方向，镜像由导出阶段完成。
+    let mut excess: HashMap<PairKey, Stratum> = HashMap::new();
     for ((a, b), p) in &pairs {
         if a >= b {
             continue;
         }
-        let e = log5(base.get(a).copied().unwrap_or(0.5), base.get(b).copied().unwrap_or(0.5));
-        let d = residual_delta(p.w, p.n, e, c);
-        delta.insert((*a, *b), d);
-        delta.insert((*b, *a), -d);
+        let e_ab = log5(
+            base.get(a).copied().unwrap_or(0.5),
+            base.get(b).copied().unwrap_or(0.5),
+        );
+        let n = p.n as f64;
+        excess.insert(
+            (*a, *b),
+            Stratum {
+                n,
+                e: p.w as f64 - n * e_ab,
+            },
+        );
     }
 
-    let min_samples = opts.matchup_min_samples as u64;
+    MapCore {
+        map_name: map_name.to_string(),
+        mode,
+        total_games: rows.len() as u64,
+        total_weight,
+        acc,
+        pairs,
+        excess,
+    }
+}
+
+/// 把各图的超额胜场汇总成「模式层」与「全库层」。
+///
+/// 汇总的是 `e`（已按各自图的基础胜率去偏），因此不存在辛普森悖论；
+/// 同一批对局只会进入 `global` 与它所属的那个 `mode` 各一次。
+fn aggregate_excess(
+    cores: &[MapCore],
+    mode_index: &HashMap<&str, usize>,
+) -> (
+    HashMap<ModePairKey, Stratum>,
+    HashMap<PairKey, Stratum>,
+) {
+    let mut by_mode: HashMap<ModePairKey, Stratum> = HashMap::new();
+    let mut global: HashMap<PairKey, Stratum> = HashMap::new();
+
+    for core in cores {
+        let mi = mode_index[core.mode.as_str()];
+        for (pair, s) in &core.excess {
+            let m = by_mode.entry((mi, pair.0, pair.1)).or_default();
+            m.n += s.n;
+            m.e += s.e;
+
+            let g = global.entry(*pair).or_default();
+            g.n += s.n;
+            g.e += s.e;
+        }
+    }
+
+    (by_mode, global)
+}
+
+// ---------------------------------------------------------------------------
+// 克制残差（导出用，单位：百分点）
+// ---------------------------------------------------------------------------
+
+/// 单张地图的克制残差矩阵：`(A, B) -> delta_pp`，已过滤噪音并双向镜像。
+fn map_deltas(
+    core: &MapCore,
+    mode_idx: usize,
+    mode_excess: &HashMap<ModePairKey, Stratum>,
+    global_excess: &HashMap<PairKey, Stratum>,
+) -> HashMap<PairKey, f64> {
+    let mut out: HashMap<PairKey, f64> = HashMap::with_capacity(core.excess.len() * 2);
+
+    for ((lo, hi), s1) in &core.excess {
+        let m = mode_excess.get(&(mode_idx, *lo, *hi)).copied().unwrap_or(*s1);
+        let g = global_excess.get(&(*lo, *hi)).copied().unwrap_or(*s1);
+
+        // 三组互斥数据：本图 / 同模式其他图 / 其他模式
+        let (delta, eff_n) = hierarchical_delta(
+            s1.n,
+            s1.e,
+            (m.n - s1.n).max(0.0),
+            m.e - s1.e,
+            (g.n - m.n).max(0.0),
+            g.e - m.e,
+        );
+        if !passes_export_filter(delta, eff_n) {
+            continue;
+        }
+        let pp = round2(delta * 100.0);
+        out.insert((*lo, *hi), pp);
+        // 精确镜像，保证 delta_BA == -delta_AB
+        out.insert((*hi, *lo), -pp);
+    }
+
+    out
+}
+
+/// 模式层的克制残差：把「本图」换成「整个模式」，其他模式作为外部先验。
+fn mode_deltas(
+    mode_idx: usize,
+    mode_excess: &HashMap<ModePairKey, Stratum>,
+    global_excess: &HashMap<PairKey, Stratum>,
+) -> HashMap<PairKey, f64> {
+    let mut out: HashMap<PairKey, f64> = HashMap::new();
+
+    for ((mi, lo, hi), s) in mode_excess {
+        if *mi != mode_idx {
+            continue;
+        }
+        let g = global_excess.get(&(*lo, *hi)).copied().unwrap_or(*s);
+        let (delta, eff_n) = hierarchical_delta(
+            s.n,
+            s.e,
+            0.0,
+            0.0,
+            (g.n - s.n).max(0.0),
+            g.e - s.e,
+        );
+        if !passes_export_filter(delta, eff_n) {
+            continue;
+        }
+        let pp = round2(delta * 100.0);
+        out.insert((*lo, *hi), pp);
+        out.insert((*hi, *lo), -pp);
+    }
+
+    out
+}
+
+/// 从一组对位统计中提取每个英雄的对位画像（最差 delta + 极差）。
+///
+/// 只统计**通过导出门槛**的对位边；不足 [`MIN_MATCHUPS_FOR_PROFILE`] 条边的英雄
+/// 不产生画像（没有画像就不会被判 `LAST`，也不会被「被康特」惩罚扣分）。
+fn extract_profiles(
+    pairs: &HashMap<PairKey, PairStat>,
+    delta: &HashMap<PairKey, f64>,
+) -> HashMap<i64, MatchupProfile> {
+    let mut agg: HashMap<i64, (f64, f64, usize)> = HashMap::new();
+    for (from, to) in pairs.keys() {
+        let Some(&d) = delta.get(&(*from, *to)) else {
+            continue;
+        };
+        let e = agg
+            .entry(*from)
+            .or_insert((f64::INFINITY, f64::NEG_INFINITY, 0));
+        e.0 = e.0.min(d);
+        e.1 = e.1.max(d);
+        e.2 += 1;
+    }
+
+    agg.into_iter()
+        .filter(|(_, (_, _, count))| *count >= MIN_MATCHUPS_FOR_PROFILE)
+        .map(|(id, (worst, best, _))| {
+            (
+                id,
+                MatchupProfile {
+                    worst_pp: worst,
+                    spread_pp: best - worst,
+                },
+            )
+        })
+        .collect()
+}
+
+/// 按英雄枚举已导出的克制条目（只保留 `delta` 里存在的边）。
+fn matchups_of(
+    id: i64,
+    pairs: &HashMap<PairKey, PairStat>,
+    delta: &HashMap<PairKey, f64>,
+) -> Vec<Matchup> {
+    pairs
+        .iter()
+        .filter(|((from, _), _)| *from == id)
+        .filter_map(|((_, to), p)| {
+            delta.get(&(id, *to)).map(|d| Matchup {
+                opponent: *to,
+                delta: *d,
+                samples: p.n,
+            })
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// 模式维度
+// ---------------------------------------------------------------------------
+
+fn build_mode(
+    mode: &str,
+    mode_idx: usize,
+    cores: &[&MapCore],
+    mode_excess: &HashMap<ModePairKey, Stratum>,
+    global_excess: &HashMap<PairKey, Stratum>,
+    dict: &HashMap<i64, String>,
+    opts: &AnalyzeOptions,
+) -> ModeMeta {
+    // 每场对局只属于一张图，所以模式层的累加就是各图累加之和
+    let mut acc: HashMap<i64, Accum> = HashMap::new();
+    let mut pairs: HashMap<PairKey, PairStat> = HashMap::new();
+    let mut total_games = 0u64;
+    let mut total_weight = 0.0f64;
+
+    for core in cores {
+        total_games += core.total_games;
+        total_weight += core.total_weight;
+        for (id, a) in &core.acc {
+            acc.entry(*id).or_default().merge(a);
+        }
+        for (key, p) in &core.pairs {
+            pairs.entry(*key).or_default().merge(p);
+        }
+    }
+
+    let delta = mode_deltas(mode_idx, mode_excess, global_excess);
+
     let mut brawlers: Vec<ModeBrawlerStat> = acc
         .iter()
         .map(|(id, a)| {
-            let mut matchups: Vec<Matchup> = pairs
-                .iter()
-                .filter(|((from, _), p)| *from == *id && p.n >= min_samples)
-                .map(|((_, to), p)| Matchup {
-                    opponent: *to,
-                    delta: round2(delta.get(&(*id, *to)).copied().unwrap_or(0.0)),
-                    samples: p.n,
-                })
-                .collect();
+            let mut matchups = matchups_of(*id, &pairs, &delta);
             // 先按显著度取 Top K，再按强度排序，兼顾体积与可读性
             matchups.sort_by(|x, y| {
                 y.delta
@@ -544,53 +861,11 @@ fn build_mode(
             .then_with(|| a.id.cmp(&b.id))
     });
 
-    (
-        ModeMeta {
-            mode: mode.to_string(),
-            total_games: rows.len() as u64,
-            brawlers,
-        },
-        ModeContext { base, pairs },
-    )
-}
-
-/// 从一组对位统计中提取每个英雄的对位画像（最差 delta + 极差）。
-///
-/// 只统计样本达标的对位边；不足 [`MIN_MATCHUPS_FOR_PROFILE`] 条边的英雄不产生画像
-/// （没有画像就不会被判 `LAST`，也不会被「被康特」惩罚扣分）。
-fn extract_profiles(
-    pairs: &HashMap<(i64, i64), PairStat>,
-    delta: &HashMap<(i64, i64), f64>,
-    min_samples: u64,
-) -> HashMap<i64, MatchupProfile> {
-    let mut agg: HashMap<i64, (f64, f64, usize)> = HashMap::new();
-    for ((from, to), p) in pairs {
-        if p.n < min_samples {
-            continue;
-        }
-        let Some(&d) = delta.get(&(*from, *to)) else {
-            continue;
-        };
-        let e = agg
-            .entry(*from)
-            .or_insert((f64::INFINITY, f64::NEG_INFINITY, 0));
-        e.0 = e.0.min(d);
-        e.1 = e.1.max(d);
-        e.2 += 1;
+    ModeMeta {
+        mode: mode.to_string(),
+        total_games,
+        brawlers,
     }
-
-    agg.into_iter()
-        .filter(|(_, (_, _, count))| *count >= MIN_MATCHUPS_FOR_PROFILE)
-        .map(|(id, (worst, best, _))| {
-            (
-                id,
-                MatchupProfile {
-                    worst_pp: worst,
-                    spread_pp: best - worst,
-                },
-            )
-        })
-        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -609,107 +884,31 @@ struct DraftCandidate {
 }
 
 fn build_map(
-    map_name: &str,
-    rows: &[(&BattleRow, f64)],
-    contexts: &HashMap<&str, &ModeContext>,
+    core: &MapCore,
+    mode_idx: usize,
+    mode_excess: &HashMap<ModePairKey, Stratum>,
+    global_excess: &HashMap<PairKey, Stratum>,
     dict: &HashMap<i64, String>,
     opts: &AnalyzeOptions,
 ) -> MapMeta {
-    let total_weight: f64 = rows.iter().map(|(_, w)| *w).sum();
-    let mut acc: HashMap<i64, Accum> = HashMap::new();
-    let mut pairs: HashMap<(i64, i64), PairStat> = HashMap::new();
-    let mut mode_votes: HashMap<&str, u64> = HashMap::new();
+    // 本图 delta：本图残差为主，同模式 / 其他模式按互斥权重做先验
+    let delta = map_deltas(core, mode_idx, mode_excess, global_excess);
 
-    for (row, weight) in rows {
-        *mode_votes.entry(row.mode.as_str()).or_insert(0) += 1;
-        for b in &row.winners {
-            acc.entry(*b).or_default().add_appearance(*weight, true);
-        }
-        for b in &row.losers {
-            acc.entry(*b).or_default().add_appearance(*weight, false);
-        }
-        for a in &row.winners {
-            for b in &row.losers {
-                if a == b {
-                    continue;
-                }
-                pairs.entry((*a, *b)).or_default().add_win();
-                pairs.entry((*b, *a)).or_default().add_loss();
-            }
-        }
-    }
+    // 本图对位画像：顺位判定只看这张图上已导出的克制关系
+    let map_profiles = extract_profiles(&core.pairs, &delta);
 
-    let mode = mode_votes
-        .into_iter()
-        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(a.0)))
-        .map(|(m, _)| m.to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-
-    let c = opts.matchup_smoothing_c.max(0.0);
-    let trust = DEFAULT_MAP_MATCHUP_TRUST_SAMPLES as f64;
-
-    let base: HashMap<i64, f64> = acc
-        .iter()
-        .map(|(id, a)| {
-            let p = smoothed_rate(
-                a.raw_wins as f64,
-                a.raw_games as f64,
-                opts.bayes_prior_weight,
-            );
-            (*id, clamp_base(p))
-        })
-        .collect();
-
-    let ctx = contexts.get(mode.as_str()).copied();
-
-    // 地图级 delta：单图残差为主，样本不足时向「留一图」的模式残差收缩
-    let mut delta: HashMap<(i64, i64), f64> = HashMap::with_capacity(pairs.len());
-    for ((a, b), p) in &pairs {
-        if a >= b {
-            continue;
-        }
-        let p_a = base.get(a).copied().unwrap_or(0.5);
-        let p_b = base.get(b).copied().unwrap_or(0.5);
-        let e_map = log5(p_a, p_b);
-
-        let prior_pp = match ctx {
-            Some(cx) => {
-                let mode_pair = cx.pairs.get(&(*a, *b)).copied().unwrap_or_default();
-                // 留一图：扣掉本图的贡献，避免先验里重复计入同一批对局
-                let n_other = mode_pair.n.saturating_sub(p.n);
-                let w_other = mode_pair.w.saturating_sub(p.w);
-                if n_other == 0 {
-                    0.0
-                } else {
-                    let e_mode = log5(
-                        cx.base.get(a).copied().unwrap_or(p_a),
-                        cx.base.get(b).copied().unwrap_or(p_b),
-                    );
-                    residual_delta(w_other, n_other, e_mode, c)
-                }
-            }
-            None => 0.0,
-        };
-
-        let d = map_delta(p.n, p.w, e_map, prior_pp, c, trust);
-        delta.insert((*a, *b), d);
-        delta.insert((*b, *a), -d);
-    }
-
-    // 本图对位画像：顺位判定只看这张图上的克制关系
-    let min_export = DEFAULT_MAP_MATCHUP_MIN_SAMPLES as u64;
-    let map_profiles = extract_profiles(&pairs, &delta, min_export);
-
-    let max_use = acc
+    let max_use = core
+        .acc
         .values()
-        .map(|a| ratio(a.games, total_weight))
+        .map(|a| ratio(a.games, core.total_weight))
         .fold(0.0_f64, f64::max);
 
     // 第一轮：算平滑胜率、出场率与未归一化的综合分
-    let mut pre: Vec<(i64, Accum, f64, f64)> = acc
+    let mut pre: Vec<(i64, Accum, f64, f64)> = core
+        .acc
         .iter()
         .map(|(id, a)| {
-            let use_rate = ratio(a.games, total_weight);
+            let use_rate = ratio(a.games, core.total_weight);
             let smoothed = smoothed_rate(a.wins, a.games, opts.bayes_prior_weight);
             let raw_score = raw_score_of(a.raw_games, use_rate, smoothed, max_use);
             (*id, *a, smoothed, raw_score)
@@ -722,7 +921,7 @@ fn build_map(
     // 本来就贴近下限，把它们算进分母会把整个有效区间压扁，制造断崖。
     let (raw_min, raw_max) = pre
         .iter()
-        .filter(|(_, a, _, _)| is_score_eligible(a.raw_games, ratio(a.games, total_weight)))
+        .filter(|(_, a, _, _)| is_score_eligible(a.raw_games, ratio(a.games, core.total_weight)))
         .map(|p| p.3)
         .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| {
             (lo.min(v), hi.max(v))
@@ -733,7 +932,7 @@ fn build_map(
     let mut candidates: Vec<DraftCandidate> = pre
         .drain(..)
         .map(|(id, a, smoothed, raw_score)| {
-            let use_rate = ratio(a.games, total_weight);
+            let use_rate = ratio(a.games, core.total_weight);
             let score = normalize_score(raw_score, raw_min, span, degenerate);
             // 极冷门英雄（场次或出场率不足）不给高分，直接封顶
             let score = if is_cold(a.raw_games, use_rate) {
@@ -749,21 +948,11 @@ fn build_map(
             // 存在明显劣势对位时扣分：delta 越低扣得越多。
             // 这里的 delta 全部来自**本图**，不会把别的地形的克制算进来。
             let penalty = worst_pp
-                .map(|w| {
-                    ((FLEX_PIVOT_PP - w) / FLEX_MAX_PENALTY_PP).clamp(0.0, 1.0)
-                })
+                .map(|w| ((FLEX_PIVOT_PP - w) / FLEX_MAX_PENALTY_PP).clamp(0.0, 1.0))
                 .unwrap_or(0.0);
             let flex = smoothed - FLEX_PENALTY * penalty;
 
-            let mut matchups: Vec<Matchup> = pairs
-                .iter()
-                .filter(|((from, _), p)| *from == id && p.n >= min_export)
-                .map(|((_, to), p)| Matchup {
-                    opponent: *to,
-                    delta: round2(delta.get(&(id, *to)).copied().unwrap_or(0.0)),
-                    samples: p.n,
-                })
-                .collect();
+            let mut matchups = matchups_of(id, &core.pairs, &delta);
             let edge_count = matchups.len();
             truncate_matchups(&mut matchups);
 
@@ -775,7 +964,7 @@ fn build_map(
                     wins: a.raw_wins,
                     win_rate: round4(ratio(a.wins, a.games)),
                     smoothed_wr: round4(smoothed),
-                    use_rate: round4(ratio(a.games, total_weight)),
+                    use_rate: round4(use_rate),
                     score: round4(score),
                     pick_order: PickOrder::Middle,
                     matchups,
@@ -799,9 +988,9 @@ fn build_map(
     });
 
     MapMeta {
-        map_name: map_name.to_string(),
-        mode,
-        total_games: rows.len() as u64,
+        map_name: core.map_name.clone(),
+        mode: core.mode.clone(),
+        total_games: core.total_games,
         brawlers,
     }
 }
@@ -1073,8 +1262,7 @@ mod tests {
     fn opts() -> AnalyzeOptions {
         AnalyzeOptions {
             bayes_prior_weight: 50.0,
-            matchup_smoothing_c: DEFAULT_MATCHUP_SMOOTHING_C,
-            matchup_min_samples: 6,
+            matchup_prior_k: MATCHUP_PRIOR_K,
             min_tier: 20,
             season_start: "2026-07-20".into(),
             roles: RolesConfig {
@@ -1095,11 +1283,27 @@ mod tests {
             .expect("模式应存在")
     }
 
+    fn find_map<'a>(out: &'a MetaOutput, name: &str) -> &'a MapMeta {
+        out.maps
+            .iter()
+            .find(|m| m.map_name == name)
+            .expect("地图应存在")
+    }
+
     fn find_mode_brawler(mode: &ModeMeta, id: i64) -> &ModeBrawlerStat {
         mode.brawlers
             .iter()
             .find(|b| b.id == id)
             .expect("英雄应存在")
+    }
+
+    /// 取某英雄在某图上的某条克制记录（不存在返回 None）。
+    fn matchup_on_map(map: &MapMeta, from: i64, to: i64) -> Option<Matchup> {
+        map.brawlers
+            .iter()
+            .find(|b| b.id == from)
+            .and_then(|b| b.matchups.iter().find(|m| m.opponent == to))
+            .cloned()
     }
 
     fn dummy_candidate(id: i64, flex: f64, spread_pp: f64) -> DraftCandidate {
@@ -1139,6 +1343,35 @@ mod tests {
             .collect()
     }
 
+    /// 对位阶梯：n 场 `A(1)` 击败 `B(2)`，外加 n 场 `C(3)` 击败 `A(1)`。
+    ///
+    /// A 的总战绩是 n 胜 n 负，基础胜率恰好 50%（平滑后也精确为 0.5），
+    /// 于是 A 对 B 的超额胜场完全来自「对位关系」本身，可以手算复核：
+    ///
+    /// ```text
+    /// p_B   = 25 / (n + 50)              // B 全败
+    /// E_AB  = 1 - p_B
+    /// e     = n * (1 - E_AB) = 25n / (n + 50)
+    /// delta = e / (n + 50) = 25n / (n + 50)^2
+    /// ```
+    ///
+    /// n = 25 -> 11.11pp，n = 50 -> 12.5pp，n = 100 -> 11.11pp。
+    fn counter_ladder(map: &str, mode: &str, n: usize, tag: &str) -> Vec<BattleRow> {
+        let mut out = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            let mut win = row(map, mode, [1, 10, 11], [2, 12, 13]);
+            win.battle_hash = format!("{tag}-w{i}");
+            out.push(win);
+
+            let mut lose = row(map, mode, [3, 12, 13], [1, 10, 11]);
+            lose.battle_hash = format!("{tag}-l{i}");
+            out.push(lose);
+        }
+        out
+    }
+
+    const ALL: [i64; 6] = [1, 2, 3, 10, 11, 12];
+
     // -----------------------------------------------------------------------
     // Log5 数学
     // -----------------------------------------------------------------------
@@ -1168,24 +1401,68 @@ mod tests {
         assert!((e - 0.95 * 0.95 / (0.95 * 0.95 + 0.05 * 0.05)).abs() < 1e-12);
     }
 
+    // -----------------------------------------------------------------------
+    // 互斥分层平滑
+    // -----------------------------------------------------------------------
+
     #[test]
-    fn residual_delta_shrinks_small_samples() {
-        // 5 场全胜、E=0.5 -> 分子 2.5；C=15 -> 2.5/20*100 = 12.5pp
-        assert!((residual_delta(5, 5, 0.5, 15.0) - 12.5).abs() < 1e-9);
-        // 同样全胜但 50 场 -> 25/65*100 ≈ 38.46pp
-        assert!((residual_delta(50, 50, 0.5, 15.0) - 25.0 / 65.0 * 100.0).abs() < 1e-9);
-        // 符合预期时残差为 0
-        assert!(residual_delta(10, 20, 0.5, 15.0).abs() < 1e-12);
+    fn hierarchical_delta_is_antisymmetric() {
+        // 交换 A/B 时：n1/n2/n3 不变，e1/e2/e3 全部取反 -> delta 精确取反
+        let (ab, eff_ab) = hierarchical_delta(40.0, 6.0, 100.0, 12.0, 200.0, -8.0);
+        let (ba, eff_ba) = hierarchical_delta(40.0, -6.0, 100.0, -12.0, 200.0, 8.0);
+        assert!((ab + ba).abs() < 1e-12, "delta_BA 必须是 -delta_AB");
+        assert!((eff_ab - eff_ba).abs() < 1e-12);
     }
 
     #[test]
-    fn residual_delta_is_antisymmetric() {
-        let n = 40u64;
-        let w = 26u64;
-        let e = log5(0.58, 0.47);
-        let ab = residual_delta(w, n, e, 15.0);
-        let ba = residual_delta(n - w, n, 1.0 - e, 15.0);
-        assert!((ab + ba).abs() < 1e-12, "delta_BA 必须是 -delta_AB");
+    fn ten_games_six_wins_is_below_noise_threshold() {
+        // 10 场 6 胜、E = 0.5 -> e = 1；delta = 1 / (10 + 50) ≈ 0.0167 < 0.02
+        let (delta, eff_n) = hierarchical_delta(10.0, 1.0, 0.0, 0.0, 0.0, 0.0);
+        assert!(
+            delta < MIN_MATCHUP_ABS_DELTA,
+            "10 场 6 胜的残差必须低于噪音门槛，实际 {delta}"
+        );
+        assert!((delta - 1.0 / 60.0).abs() < 1e-12);
+        assert!(!passes_export_filter(delta, eff_n), "样本不足时不得导出");
+    }
+
+    #[test]
+    fn external_samples_are_discounted_and_capped() {
+        // 同模式 10000 场 -> 折算 0.6 后封顶 40；其他模式 10000 场 -> 封顶 25
+        let (delta, eff_n) = hierarchical_delta(0.0, 0.0, 10_000.0, 1_000.0, 10_000.0, 1_000.0);
+        assert!((eff_n - 65.0).abs() < 1e-9, "eff_n 应为 40 + 25，实际 {eff_n}");
+        // e 同步按比例缩放：40/10000 * 1000 + 25/10000 * 1000 = 4 + 2.5
+        assert!((delta - 6.5 / 115.0).abs() < 1e-12, "实际 {delta}");
+    }
+
+    #[test]
+    fn large_local_sample_overrides_external_prior() {
+        // 本图 200 场、+20 超额胜场（10% 残差）；同模式其他图 300 场却强烈反向
+        let (delta, eff_n) = hierarchical_delta(200.0, 20.0, 300.0, -30.0, 0.0, 0.0);
+        assert!(eff_n > 200.0);
+        assert!(
+            delta > 0.05,
+            "本图大样本必须能反转外部先验，实际 {delta}"
+        );
+        assert!(passes_export_filter(delta, eff_n));
+    }
+
+    #[test]
+    fn thin_local_sample_defers_to_external_prior() {
+        // 本图只有 10 场且略负，外部 300 场强正 -> 结果由先验主导
+        let (delta, _) = hierarchical_delta(10.0, -1.0, 300.0, 30.0, 0.0, 0.0);
+        assert!(
+            delta > MIN_MATCHUP_ABS_DELTA,
+            "薄样本应被外部先验拉正，实际 {delta}"
+        );
+    }
+
+    #[test]
+    fn zero_external_samples_do_not_create_nan() {
+        let (delta, eff_n) = hierarchical_delta(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        assert!(delta.is_finite() && delta == 0.0);
+        assert_eq!(eff_n, 0.0);
+        assert!(!passes_export_filter(delta, eff_n));
     }
 
     // -----------------------------------------------------------------------
@@ -1302,67 +1579,54 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // 模式级克制矩阵
+    // 模式级克制
     // -----------------------------------------------------------------------
 
     #[test]
-    fn matchups_aggregate_across_maps_of_same_mode() {
-        // A(1) 与 B(2) 在两张同模式地图上各交锋 3 场，合计 6 场
-        // 按单图切碎时各自只有 3 场（低于导出阈值 6），按模式聚合后应达标
-        let mut battles = Vec::new();
-        for (map, count) in [("M1", 3), ("M2", 3)] {
-            for i in 0..count {
-                let mut r = row(map, "brawlBall", [1, 10, 11], [2, 12, 13]);
-                r.battle_hash = format!("{map}-{i}");
-                battles.push(r);
-            }
-        }
+    fn mode_matchups_sum_excess_wins_across_maps() {
+        // 两张同模式地图各 25 场阶梯（每层 25 胜 + 25 负 = 50 局）：
+        // 对位样本 N_mode = 50，超额胜场 = 2 * 8.333，delta = 16.67 / 100 ≈ 16.67pp
+        let mut battles = counter_ladder("M1", "brawlBall", 25, "m1");
+        battles.extend(counter_ladder("M2", "brawlBall", 25, "m2"));
 
-        let ids = vec![1, 2, 10, 11, 12, 13];
-        let out = analyze(&battles, &dict(&ids), &opts());
-
-        assert_eq!(out.maps.len(), 2, "地图维度仍按图切分");
+        let out = analyze(&battles, &dict(&ALL), &opts());
         assert_eq!(out.modes.len(), 1, "同模式应聚合成一条");
 
         let mode = find_mode(&out, "brawlBall");
-        assert_eq!(mode.total_games, 6);
-        let a = find_mode_brawler(mode, 1);
-        let a_vs_b = a
+        assert_eq!(mode.total_games, 100);
+        let a_vs_b = find_mode_brawler(mode, 1)
             .matchups
             .iter()
             .find(|m| m.opponent == 2)
-            .expect("跨图聚合后应达到 6 场阈值");
-        assert_eq!(a_vs_b.samples, 6);
-        // 6 场全胜，但基础胜率也高 -> 残差必须远小于「100% - 预期」
-        assert!(a_vs_b.delta > 0.0, "全胜应表现为正 delta");
-        assert!(a_vs_b.delta < 50.0, "小样本残差应被 C 平滑");
+            .expect("模式层应导出 A 对 B")
+            .clone();
+        assert_eq!(a_vs_b.samples, 50);
+        assert!(
+            (a_vs_b.delta - 16.67).abs() < 0.05,
+            "模式层 delta 应为 16.67pp，实际 {}",
+            a_vs_b.delta
+        );
     }
 
     #[test]
-    fn matchup_delta_is_strictly_antisymmetric() {
-        let mut battles = Vec::new();
-        for i in 0..20 {
-            let mut r = if i < 12 {
-                row("M", "gemGrab", [1, 10, 11], [2, 12, 13])
-            } else {
-                row("M", "gemGrab", [2, 12, 13], [1, 10, 11])
-            };
-            r.battle_hash = format!("h{i}");
-            battles.push(r);
-        }
-
-        let ids = vec![1, 2, 10, 11, 12, 13];
-        let out = analyze(&battles, &dict(&ids), &opts());
+    fn mode_delta_is_strictly_antisymmetric() {
+        let battles = counter_ladder("M", "gemGrab", 25, "g");
+        let out = analyze(&battles, &dict(&ALL), &opts());
         let mode = find_mode(&out, "gemGrab");
 
-        let a = find_mode_brawler(mode, 1);
-        let a_vs_b = a.matchups.iter().find(|m| m.opponent == 2).unwrap();
-        assert_eq!(a_vs_b.samples, 20);
-        assert!(a_vs_b.delta > 0.0);
-
-        let b = find_mode_brawler(mode, 2);
-        let b_vs_a = b.matchups.iter().find(|m| m.opponent == 1).unwrap();
-        assert_eq!(b_vs_a.samples, 20);
+        let a_vs_b = find_mode_brawler(mode, 1)
+            .matchups
+            .iter()
+            .find(|m| m.opponent == 2)
+            .unwrap()
+            .clone();
+        let b_vs_a = find_mode_brawler(mode, 2)
+            .matchups
+            .iter()
+            .find(|m| m.opponent == 1)
+            .unwrap()
+            .clone();
+        assert_eq!(b_vs_a.samples, a_vs_b.samples);
         // 导出精度 2 位小数，反对称必须精确成立
         assert_eq!(b_vs_a.delta, -a_vs_b.delta);
     }
@@ -1392,19 +1656,23 @@ mod tests {
         }
         let ids = vec![1, 2, 3, 10, 11, 12, 13];
         let out = analyze(&battles, &dict(&ids), &opts());
-        let mode = find_mode(&out, "brawlBall");
-        let one = find_mode_brawler(mode, 1);
-        let vs_two = one.matchups.iter().find(|m| m.opponent == 2).unwrap();
+        let one = find_mode_brawler(find_mode(&out, "brawlBall"), 1);
+        // 残差被平滑到门槛以下（条目不导出）或足够小，都说明没有被判成强力康特
+        let delta = one
+            .matchups
+            .iter()
+            .find(|m| m.opponent == 2)
+            .map(|m| m.delta.abs())
+            .unwrap_or(0.0);
         assert!(
-            vs_two.delta.abs() < 8.0,
-            "基础强度高的英雄不应被判成强力康特，实际 delta={}",
-            vs_two.delta
+            delta < 8.0,
+            "基础强度高的英雄不应被判成强力康特，实际 delta={delta}"
         );
     }
 
     #[test]
-    fn matchup_below_threshold_is_dropped() {
-        // 5 场 < 阈值 6
+    fn matchup_below_eff_threshold_is_dropped() {
+        // 5 场 < eff_n 门槛 15
         let battles = battles_with("M", "brawlBall", [1, 10, 11], [2, 12, 13], 5);
         let ids = vec![1, 2, 10, 11, 12, 13];
         let out = analyze(&battles, &dict(&ids), &opts());
@@ -1413,74 +1681,142 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // 地图级克制 + 层级收缩
+    // 地图级克制 + 互斥分层
     // -----------------------------------------------------------------------
 
     #[test]
-    fn map_matchups_exist_at_lower_threshold_than_mode() {
-        // 单图 8 场：满足地图阈值 5，可导出
-        let battles = battles_with("M", "brawlBall", [1, 10, 11], [2, 12, 13], 8);
-        let ids = vec![1, 2, 10, 11, 12, 13];
-        let out = analyze(&battles, &dict(&ids), &opts());
-        let map = &out.maps[0];
-        let a = map.brawlers.iter().find(|b| b.id == 1).unwrap();
-        let vs_b = a.matchups.iter().find(|m| m.opponent == 2).unwrap();
-        assert_eq!(vs_b.samples, 8);
-        assert!(vs_b.delta > 0.0);
-    }
-
-    #[test]
-    fn map_delta_shrinks_toward_mode_prior_until_trust() {
-        let c = DEFAULT_MATCHUP_SMOOTHING_C;
-        let trust = DEFAULT_MAP_MATCHUP_TRUST_SAMPLES as f64;
-        let prior = 20.0; // 模式先验：+20pp
-
-        // 3 场全胜：单图残差 1.5；先验权重 15*(1-3/15)=12
-        let thin = map_delta(3, 3, 0.5, prior, c, trust);
-        let pure_thin = map_delta(3, 3, 0.5, 0.0, c, trust);
+    fn map_matchup_needs_enough_eff_samples() {
+        // 10 场：eff_n = 10 < 15，即使残差 6.9pp 也不导出
+        let thin = counter_ladder("M", "brawlBall", 10, "t");
+        let out = analyze(&thin, &dict(&ALL), &opts());
         assert!(
-            thin > pure_thin,
-            "薄样本应被模式先验拉高：{thin} 应大于纯单图 {pure_thin}"
+            matchup_on_map(find_map(&out, "M"), 1, 2).is_none(),
+            "eff_n 不足的条目必须被剔除"
         );
 
-        // 达到 trust 场后先验权重归零，等价于纯单图公式
-        let full = map_delta(15, 12, 0.5, prior, c, trust);
-        let pure_full = map_delta(15, 12, 0.5, 0.0, c, trust);
-        assert!((full - pure_full).abs() < 1e-12, "满 trust 后应完全信任单图");
-
-        // 0 场时退化为纯先验
-        assert!((map_delta(0, 0, 0.5, prior, c, trust) - prior).abs() < 1e-12);
-    }
-
-    #[test]
-    fn thin_map_matchup_is_dropped_from_export() {
-        // 3 场 < 地图导出阈值 5，不应出现在地图级列表里
-        let mut battles = battles_with("M1", "brawlBall", [1, 10, 11], [2, 12, 13], 30);
-        battles.extend(battles_with("M2", "brawlBall", [1, 10, 11], [2, 12, 13], 3));
-
-        let ids = vec![1, 2, 10, 11, 12, 13];
-        let out = analyze(&battles, &dict(&ids), &opts());
-
-        let m2 = out.maps.iter().find(|m| m.map_name == "M2").unwrap();
-        let a = m2.brawlers.iter().find(|b| b.id == 1).unwrap();
+        // 25 场：eff_n = 25，delta = 11.11pp，正常导出
+        let solid = counter_ladder("M", "brawlBall", 25, "s");
+        let out = analyze(&solid, &dict(&ALL), &opts());
+        let entry = matchup_on_map(find_map(&out, "M"), 1, 2).expect("25 场应导出");
+        assert_eq!(entry.samples, 25);
         assert!(
-            a.matchups.iter().all(|m| m.opponent != 2),
-            "3 场对位应被导出阈值过滤"
+            (entry.delta - 11.11).abs() < 0.05,
+            "手算 delta 应为 11.11pp，实际 {}",
+            entry.delta
         );
     }
 
     #[test]
-    fn map_matchup_is_antisymmetric() {
-        let battles = battles_with("M", "hotZone", [1, 10, 11], [2, 12, 13], 20);
-        let ids = vec![1, 2, 10, 11, 12, 13];
-        let out = analyze(&battles, &dict(&ids), &opts());
-        let map = &out.maps[0];
-        let a = map.brawlers.iter().find(|b| b.id == 1).unwrap();
-        let b = map.brawlers.iter().find(|b| b.id == 2).unwrap();
-        let ab = a.matchups.iter().find(|m| m.opponent == 2).unwrap();
-        let ba = b.matchups.iter().find(|m| m.opponent == 1).unwrap();
+    fn map_delta_is_strictly_antisymmetric() {
+        let battles = counter_ladder("M", "hotZone", 25, "h");
+        let out = analyze(&battles, &dict(&ALL), &opts());
+        let map = find_map(&out, "M");
+
+        let ab = matchup_on_map(map, 1, 2).expect("A 对 B 应导出");
+        let ba = matchup_on_map(map, 2, 1).expect("B 对 A 应导出");
         assert_eq!(ab.samples, ba.samples);
         assert_eq!(ab.delta, -ba.delta, "地图级同样必须严格反对称");
+    }
+
+    #[test]
+    fn thin_map_sample_borrows_mode_prior_but_stays_below_local() {
+        // M1 有 25 场阶梯，M2 只有 3 场：M2 的结论应被同模式先验抬起来，
+        // 但仍低于本图样本充足的 M1（本图证据优先）。
+        let mut battles = counter_ladder("M1", "brawlBall", 25, "m1");
+        battles.extend(counter_ladder("M2", "brawlBall", 3, "m2"));
+
+        let out = analyze(&battles, &dict(&ALL), &opts());
+        let d1 = matchup_on_map(find_map(&out, "M1"), 1, 2).expect("M1 应导出");
+        let d2 = matchup_on_map(find_map(&out, "M2"), 1, 2).expect("M2 应借先验导出");
+
+        // 纯本图口径（无外部样本）时 M2 只有 3 场，残差约 2.7pp
+        assert!(
+            d2.delta > 2.7,
+            "薄样本应被同模式先验抬高，实际 {}",
+            d2.delta
+        );
+        assert!(
+            d2.delta < d1.delta,
+            "本图样本不足时不应反超样本充足的图：M2={} M1={}",
+            d2.delta,
+            d1.delta
+        );
+    }
+
+    #[test]
+    fn ten_games_six_wins_is_filtered_out_end_to_end() {
+        // 10 场 6 胜 4 负，双方只打过对方 -> 基础胜率都接近 50%，
+        // 残差约 1.1pp，必须被「eff_n >= 15 且 |delta| >= 0.02」拦掉。
+        let mut battles = Vec::new();
+        for i in 0..10 {
+            let mut r = if i < 6 {
+                row("M", "bounty", [1, 10, 11], [2, 12, 13])
+            } else {
+                row("M", "bounty", [2, 12, 13], [1, 10, 11])
+            };
+            r.battle_hash = format!("n{i}");
+            battles.push(r);
+        }
+        let out = analyze(&battles, &dict(&ALL), &opts());
+        let map = find_map(&out, "M");
+        let entry = matchup_on_map(map, 1, 2);
+        if let Some(m) = entry {
+            assert!(
+                m.delta.abs() < 2.0,
+                "10 场 6 胜的残差必须低于 2pp，实际 {}",
+                m.delta
+            );
+        }
+    }
+
+    #[test]
+    fn strong_positive_residual_is_not_clamped() {
+        // 后端严禁对正残差做抹零 / 截断：50 场阶梯的理论值 12.5pp 必须原样导出
+        let battles = counter_ladder("M", "knockout", 50, "k");
+        let out = analyze(&battles, &dict(&ALL), &opts());
+        let entry = matchup_on_map(find_map(&out, "M"), 1, 2).expect("应导出");
+        assert!(
+            (entry.delta - 12.5).abs() < 0.05,
+            "正残差必须原样保留，实际 {}",
+            entry.delta
+        );
+    }
+
+    #[test]
+    fn per_map_base_rate_keeps_simpson_out_of_mode_layer() {
+        // 辛普森陷阱：A 在两张图上都强于 B，但两图的整体强度水平不同。
+        //
+        // M1 是「高手图」：C 在该图极强（p_C ≈ 0.95），A 被 C 压着打；
+        // M2 是「新手图」：A 只和 B 打。
+        // 若先把两图的胜场混在一起再算 Log5，A 的混合基础胜率会被 M2 拉高，
+        // 从而低估 A 对 B 的克制；按图分层去偏后，模式层应保留明显的正残差。
+        let mut battles = counter_ladder("M1", "brawlBall", 25, "m1");
+        battles.extend(battles_with(
+            "M2",
+            "brawlBall",
+            [1, 10, 11],
+            [2, 12, 13],
+            25,
+        ));
+        for (i, b) in battles.iter_mut().enumerate() {
+            if b.map_name == "M2" {
+                b.battle_hash = format!("m2-{i}");
+            }
+        }
+
+        let out = analyze(&battles, &dict(&ALL), &opts());
+        let mode = find_mode(&out, "brawlBall");
+        let entry = find_mode_brawler(mode, 1)
+            .matchups
+            .iter()
+            .find(|m| m.opponent == 2)
+            .expect("模式层应导出 A 对 B")
+            .clone();
+        assert!(
+            entry.delta > 10.0,
+            "按图去偏后 A 对 B 的克制不应被跨图混合稀释，实际 {}",
+            entry.delta
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1577,11 +1913,17 @@ mod tests {
         }
         // 7 个合格英雄：LAST = round(7*0.22) = 2，FIRST = 2
         assert_eq!(
-            cands.iter().filter(|c| c.stat.pick_order == PickOrder::Last).count(),
+            cands
+                .iter()
+                .filter(|c| c.stat.pick_order == PickOrder::Last)
+                .count(),
             2
         );
         assert_eq!(
-            cands.iter().filter(|c| c.stat.pick_order == PickOrder::First).count(),
+            cands
+                .iter()
+                .filter(|c| c.stat.pick_order == PickOrder::First)
+                .count(),
             2
         );
     }
@@ -1690,20 +2032,29 @@ mod tests {
 
     #[test]
     fn counter_pick_brawler_is_marked_last_on_map() {
+        // 1 号稳吃 2 号，却被 3 号、4 号完克：对位画像呈明显两极（极差约 20pp），
+        // 且有 3 条以上显著对位边，应判 LAST（后手康特位）。
         let mut battles = Vec::new();
         for i in 0..20 {
             let mut win = row("M", "brawlBall", [1, 10, 11], [2, 12, 13]);
             win.battle_hash = format!("a{i}");
             battles.push(win);
 
-            let mut lose = row("M", "brawlBall", [3, 12, 13], [1, 10, 11]);
-            lose.battle_hash = format!("b{i}");
-            battles.push(lose);
+            for (tag, counter) in [("b", 3), ("c", 4)] {
+                let mut lose = row("M", "brawlBall", [counter, 12, 13], [1, 10, 11]);
+                lose.battle_hash = format!("{tag}{i}");
+                battles.push(lose);
+            }
         }
-        let ids = vec![1, 2, 3, 10, 11, 12, 13];
+        let ids = vec![1, 2, 3, 4, 10, 11, 12, 13];
         let out = analyze(&battles, &dict(&ids), &opts());
         let one = out.maps[0].brawlers.iter().find(|b| b.id == 1).unwrap();
 
+        assert!(
+            one.matchups.len() >= PICK_MIN_EDGES,
+            "显著康特关系应被导出，实际 {} 条",
+            one.matchups.len()
+        );
         assert_eq!(one.pick_order, PickOrder::Last);
     }
 

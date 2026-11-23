@@ -128,11 +128,17 @@ mod tests {
             },
             params: AnalysisParams {
                 bayes_prior_weight: 50.0,
-                matchup_smoothing_c: 15.0,
-                matchup_min_samples: 6,
-                map_matchup_min_samples: 5,
+                matchup_smoothing_c: 50.0,
+                matchup_min_samples: 15,
+                map_matchup_min_samples: 15,
                 map_matchup_trust_samples: 15,
                 decay_half_life_days: 30.0,
+                matchup_min_eff_samples: 15.0,
+                matchup_min_abs_delta: 0.02,
+                same_mode_weight: 0.6,
+                same_mode_cap: 40.0,
+                other_mode_weight: 0.3,
+                other_mode_cap: 25.0,
             },
             brawlers: vec![
                 BrawlerRef {

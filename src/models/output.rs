@@ -12,16 +12,24 @@
 //!
 //! ## 克制口径
 //!
-//! `delta` 是 **Log5 预期胜率残差**（单位：百分点，保留 2 位小数），不是原始胜率：
+//! `delta` 是 **地图分层去偏后的 Log5 超额胜场残差**（单位：百分点，保留 2 位小数），
+//! 不是原始胜率：
 //!
 //! ```text
-//! E_AB   = (p_A(1-p_B)) / (p_A(1-p_B) + (1-p_A)p_B)     // Log5 预期对位胜率
-//! delta  = (w_AB - n_AB * E_AB) / (n_AB + C) * 100       // 净胜率差值（pp）
+//! 本图      E_ab,m = log5(p_a,m, p_b,m)        // 用**该图**基础胜率算预期
+//!           e1     = w_ab,m - n_ab,m * E_ab,m
+//! 同模式其他图 e2    = E_mode - e1                // 已扣除本图，不重复计数
+//! 其他模式    e3    = E_global - E_mode           // 已扣除本模式，不重复计数
+//! 折算      n2_eff = min(0.6*n2, 40), n3_eff = min(0.3*n3, 25)
+//! delta    = (e1 + e2_eff + e3_eff) / (n1 + n2_eff + n3_eff + 50) * 100
 //! ```
 //!
-//! 这样扣掉了「英雄本身强度」带来的胜率红利，只留下**对位关系本身**的贡献。
-//! `delta > 0` 表示 A 在对位上占优，`delta < 0` 表示 A 被克制，且严格反对称
-//! （`delta_BA = -delta_AB`）。
+//! 这样扣掉了「英雄本身强度」带来的胜率红利，只留下**对位关系本身**的贡献，
+//! 且按图分层避免了跨图混合的辛普森悖论。`delta > 0` 表示 A 在对位上占优，
+//! `delta < 0` 表示 A 被克制，且严格反对称（`delta_BA = -delta_AB`）。
+//!
+//! 只导出 `eff_n >= 15` 且 `|delta| >= 2pp` 的条目；**后端不做「正残差过大就
+//! 抹零」的处理**，绿灯绝对胜率由前端结合本图基础胜率自行兜底。
 //!
 //! ## 统计口径
 //!
@@ -37,6 +45,8 @@ use serde::{Deserialize, Serialize};
 /// * v2：克制矩阵从地图维度迁移到模式维度，`Matchup` 增加 `smoothed_wr`。
 /// * v3：克制改为 **Log5 残差 delta**（`opponent` / `delta` / `samples`），
 ///   地图级也导出克制列表；新增段位审计 `tier_audit`。
+///   v3 的字段结构保持不变，但克制残差的计算已升级为「地图分层去偏 + 互斥分层
+///   贝叶斯平滑」（见模块文档），`delta` 仍以百分点表示。
 pub const SCHEMA_VERSION: u32 = 3;
 
 /// 导出根节点。
@@ -148,16 +158,31 @@ pub fn tier_label(tier: i64) -> String {
 pub struct AnalysisParams {
     /// 胜率贝叶斯平滑的先验权重 m。
     pub bayes_prior_weight: f64,
-    /// 克制残差的贝叶斯平滑常数 C（伪场次），建议 15~20。
+    /// 分层贝叶斯收缩的先验强度 K（伪场次）。
+    ///
+    /// 字段名为 v3 兼容保留（旧版是 `C = 15`），语义已统一为分层收缩强度。
     pub matchup_smoothing_c: f64,
-    /// 模式级克制的最小原始对位场次（低于此值不导出）。
+    /// 导出克制条目的最小**有效样本** `eff_n`（旧字段名，语义已从原始场次改为 `eff_n`）。
     pub matchup_min_samples: u32,
-    /// 地图级克制的最小原始对位场次（低于此值不导出）。
+    /// 地图级克制的最小有效样本（与 `matchup_min_samples` 同值）。
     pub map_matchup_min_samples: u32,
-    /// 地图级对位达到该场次后完全信任单图数据，不再向模式先验收缩。
+    /// v3 兼容保留：旧版「单图场次达到该值后完全信任单图」的阈值，
+    /// 现由互斥分层加权取代，仅作回显。
     pub map_matchup_trust_samples: u32,
     /// 时间衰减半衰期（天），权重 `w = 0.5^(Δt / half_life)`。
     pub decay_half_life_days: f64,
+    /// 有效样本门槛（`eff_n >=` 该值才导出）。
+    pub matchup_min_eff_samples: f64,
+    /// 残差显著性门槛（`|delta| >=` 该值才导出，单位与计算口径一致：概率）。
+    pub matchup_min_abs_delta: f64,
+    /// 同模式其他地图的样本折算权重。
+    pub same_mode_weight: f64,
+    /// 同模式其他地图折算后的样本上限。
+    pub same_mode_cap: f64,
+    /// 其他模式的样本折算权重。
+    pub other_mode_weight: f64,
+    /// 其他模式折算后的样本上限。
+    pub other_mode_cap: f64,
 }
 
 /// 英雄字典项。
@@ -211,7 +236,7 @@ pub struct MapBrawlerStat {
     /// 选人顺位建议（依据同模式的克制矩阵 + 该图强度，按分位分配）。
     pub pick_order: PickOrder,
     /// 该图内的克制列表：前 K 个优势对位（正 delta）+ 前 K 个劣势对位（负 delta），
-    /// 按 `delta` 降序。前端弹窗可直接渲染。
+    /// 按 `delta` 降序。已按 `eff_n` / 显著性过滤，前端弹窗可直接渲染。
     pub matchups: Vec<Matchup>,
 }
 
@@ -244,7 +269,7 @@ pub struct ModeBrawlerStat {
     pub matchups: Vec<Matchup>,
 }
 
-/// 1v1 对位记录（Log5 残差口径）。
+/// 1v1 对位记录（地图分层去偏后的 Log5 残差口径）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Matchup {
     /// 对手英雄 ID。
@@ -253,6 +278,10 @@ pub struct Matchup {
     /// 严格反对称：A 对 B 的 delta 恒等于 B 对 A 的 delta 的相反数。
     pub delta: f64,
     /// 真实对位样本场次（原始计数，未加权）。
+    ///
+    /// 注意：导出过滤用的是**折算后的有效样本** `eff_n`（本图 + 同模式其他图 +
+    /// 其他模式的加权和），所以 `samples` 可能小于门槛而条目仍然存在——
+    /// 那说明结论主要来自同模式 / 全库先验，本图只是佐证。
     pub samples: u64,
 }
 

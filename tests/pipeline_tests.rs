@@ -154,8 +154,7 @@ fn mock_then_analyze_produces_valid_meta() {
 
     let opts = AnalyzeOptions {
         bayes_prior_weight: 50.0,
-        matchup_smoothing_c: 15.0,
-        matchup_min_samples: 6,
+        matchup_prior_k: 50.0,
         min_tier: 16,
         season_start: "2026-07-20".into(),
         roles,
@@ -188,9 +187,13 @@ fn mock_then_analyze_produces_valid_meta() {
             assert!((0.0..=1.0).contains(&b.use_rate));
             assert!((0.0..=1.0).contains(&b.win_rate));
             assert!((0.0..=1.0).contains(&b.smoothed_wr));
-            // 地图级克制：2 位小数、样本达阈值、无自我对位
+            // 地图级克制：2 位小数、显著（|delta| >= 2pp）、无自我对位
             for m in &b.matchups {
-                assert!(m.samples >= 5, "地图级对位低于阈值的必须被剔除");
+                assert!(
+                    m.delta.abs() >= 2.0,
+                    "地图级克制必须满足显著性门槛，实际 {}",
+                    m.delta
+                );
                 assert_ne!(m.opponent, b.id, "不应出现自我对位");
                 assert_eq!(m.delta, (m.delta * 100.0).round() / 100.0, "delta 应为 2 位小数");
             }
@@ -216,7 +219,11 @@ fn mock_then_analyze_produces_valid_meta() {
                 with_matchups += 1;
             }
             for m in &b.matchups {
-                assert!(m.samples >= 6, "低于阈值的对位必须被剔除");
+                assert!(
+                    m.delta.abs() >= 2.0,
+                    "模式级克制必须满足显著性门槛，实际 {}",
+                    m.delta
+                );
                 assert_ne!(m.opponent, b.id, "不应出现自我对位");
             }
             assert!(b.matchups.len() <= 12, "模式级克制最多导出 12 条");
@@ -242,9 +249,12 @@ fn mock_then_analyze_produces_valid_meta() {
     }
     assert!(checked > 0, "应至少校验到一组双向对位");
     let coverage = with_matchups as f64 / total_mode_brawlers as f64;
+    // 导出门槛是 eff_n >= 15 且 |delta| >= 2pp；mock 生成器本身接近可加模型
+    // （队伍强度线性决定胜率），真实克制残差很少，因此覆盖率不会像旧口径那么高。
+    // 这里只要求「存在一批有克制数据的英雄」，覆盖率本身不是正确性指标。
     assert!(
-        coverage > 0.5,
-        "模式级聚合后应有过半英雄具备克制数据，实际 {:.1}%",
+        coverage > 0.1,
+        "模式级聚合后应有一批英雄具备克制数据，实际 {:.1}%",
         coverage * 100.0
     );
 

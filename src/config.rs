@@ -46,6 +46,9 @@ pub struct Config {
     /// 贝叶斯平滑先验权重 m。
     pub bayes_prior_weight: f64,
     /// 1v1 克制矩阵最小交锋样本量。
+    ///
+    /// **已被分层口径取代**：导出过滤现在用折算后的有效样本 `eff_n >= 15`
+    /// （见 `analyzer::MIN_MATCHUP_EFF_SAMPLES`），本字段仅保留配置兼容。
     pub matchup_min_samples: u32,
     /// SQLite 数据库文件路径。
     pub database_path: PathBuf,

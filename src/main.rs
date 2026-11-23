@@ -198,8 +198,7 @@ fn cmd_analyze(cfg: &Config, pretty: bool) -> Result<()> {
     let roles = RolesConfig::load(&cfg.roles_path)?;
     let opts = AnalyzeOptions {
         bayes_prior_weight: cfg.bayes_prior_weight,
-        matchup_smoothing_c: analyzer::DEFAULT_MATCHUP_SMOOTHING_C,
-        matchup_min_samples: cfg.matchup_min_samples,
+        matchup_prior_k: analyzer::MATCHUP_PRIOR_K,
         min_tier: cfg.min_tier,
         season_start: cfg.season_start_raw.clone(),
         roles,
@@ -262,6 +261,26 @@ fn cmd_analyze(cfg: &Config, pretty: bool) -> Result<()> {
             last as f64 * 100.0 / total as f64
         );
     }
+
+    // 克制条目：新口径只导出「有效样本够 + 残差显著」的边，条数比旧版少但更干净
+    let map_entries: usize = meta
+        .maps
+        .iter()
+        .map(|m| m.brawlers.iter().map(|b| b.matchups.len()).sum::<usize>())
+        .sum();
+    let mode_entries: usize = meta
+        .modes
+        .iter()
+        .map(|m| m.brawlers.iter().map(|b| b.matchups.len()).sum::<usize>())
+        .sum();
+    println!(
+        "克制条目：地图级 {} 条 / 模式级 {} 条（门槛 eff_n >= {:.0} 且 |delta| >= {:.0}pp，K = {:.0}）",
+        map_entries,
+        mode_entries,
+        meta.params.matchup_min_eff_samples,
+        meta.params.matchup_min_abs_delta * 100.0,
+        meta.params.matchup_smoothing_c
+    );
 
     for map in meta.maps.iter().take(8) {
         let top: Vec<String> = map
