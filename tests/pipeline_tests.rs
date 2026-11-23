@@ -188,11 +188,11 @@ fn mock_then_analyze_produces_valid_meta() {
             assert!((0.0..=1.0).contains(&b.use_rate));
             assert!((0.0..=1.0).contains(&b.win_rate));
             assert!((0.0..=1.0).contains(&b.smoothed_wr));
-            // 地图级克制：2 位小数、显著（|delta| >= 1.5pp）、无自我对位
+            // 展示列表：2 位小数、显著（|delta| >= 1.5pp）、无自我对位
             for m in &b.matchups {
                 assert!(
                     m.delta.abs() >= 1.5,
-                    "地图级克制必须满足显著性门槛，实际 {}",
+                    "展示列表必须满足显著性门槛，实际 {}",
                     m.delta
                 );
                 assert_ne!(m.opponent, b.id, "不应出现自我对位");
@@ -200,16 +200,59 @@ fn mock_then_analyze_produces_valid_meta() {
             }
             assert!(
                 b.matchups.len() <= 16,
-                "地图级克制每侧最多 8 条，共 16 条"
+                "地图级展示列表每侧最多 8 条，共 16 条"
             );
             assert!(
                 b.matchups.windows(2).all(|w| w[0].delta >= w[1].delta),
-                "地图级克制必须按 delta 降序"
+                "地图级展示列表必须按 delta 降序"
             );
+        }
+
+        // ---- 地图级 3×3 查表（v5）----
+        //
+        // 查表**不截断、不按 |delta| 剪枝**：每对英雄一条 `[a, b, delta_pp, n_eff]`，
+        // 只要 `n_eff >= 5.0` 就导出，`delta_pp = 0.0` 的均势对位也保留。
+        assert!(
+            !map.matchup_table.is_empty(),
+            "{} 应产出地图级查表",
+            map.map_name
+        );
+        assert!(
+            map.matchup_table.windows(2).all(|w| (w[0].a, w[0].b) < (w[1].a, w[1].b)),
+            "{} 查表必须按 (a, b) 升序且无重复",
+            map.map_name
+        );
+        for p in &map.matchup_table {
+            assert!(p.a < p.b, "查表必须是无序键 a < b，实际 ({}, {})", p.a, p.b);
+            assert!(
+                p.n_eff >= out.params.map_matchup_table_min_eff_samples,
+                "{} 地图级查表样本不足：{} < {}",
+                map.map_name,
+                p.n_eff,
+                out.params.map_matchup_table_min_eff_samples
+            );
+            assert_eq!(p.delta_pp, (p.delta_pp * 100.0).round() / 100.0, "delta_pp 应为 2 位小数");
+            assert_eq!(p.n_eff, (p.n_eff * 10.0).round() / 10.0, "n_eff 应为 1 位小数");
+            assert!(p.delta_pp.abs() <= 100.0, "残差不可能超过 100pp");
+        }
+        // 展示列表里的每一条，都必须能在同层查表中找到**同口径**的记录：
+        // 两者共用同一套分层残差，只是过滤 / 截断策略不同。
+        for b in &map.brawlers {
+            for m in &b.matchups {
+                assert!(
+                    map.matchup_table
+                        .iter()
+                        .any(|p| p.delta_of(b.id, m.opponent) == Some(m.delta)),
+                    "{} 展示条目 {} vs {} 在查表中缺失或口径不一致",
+                    map.map_name,
+                    b.id,
+                    m.opponent
+                );
+            }
         }
     }
 
-    // ---- 模式维度（克制矩阵）----
+    // ---- 模式维度（展示列表）----
     let mut with_matchups = 0usize;
     let mut total_mode_brawlers = 0usize;
     for mode in &out.modes {
@@ -222,16 +265,33 @@ fn mock_then_analyze_produces_valid_meta() {
             for m in &b.matchups {
                 assert!(
                     m.delta.abs() >= 1.5,
-                    "模式级克制必须满足显著性门槛，实际 {}",
+                    "模式级展示列表必须满足显著性门槛，实际 {}",
                     m.delta
                 );
                 assert_ne!(m.opponent, b.id, "不应出现自我对位");
             }
-            assert!(b.matchups.len() <= 12, "模式级克制最多导出 12 条");
+            assert!(b.matchups.len() <= 12, "模式级展示列表最多导出 12 条");
+        }
+
+        // ---- 模式级 3×3 查表（v5）：同样不截断、不按 |delta| 剪枝 ----
+        assert!(
+            mode.matchup_table.windows(2).all(|w| (w[0].a, w[0].b) < (w[1].a, w[1].b)),
+            "模式 {} 查表必须按 (a, b) 升序且无重复",
+            mode.mode
+        );
+        for p in &mode.matchup_table {
+            assert!(p.a < p.b, "模式 {} 查表必须是无序键 a < b", mode.mode);
+            assert!(
+                p.n_eff >= out.params.mode_matchup_table_min_eff_samples,
+                "模式 {} 查表样本不足：{} < {}",
+                mode.mode,
+                p.n_eff,
+                out.params.mode_matchup_table_min_eff_samples
+            );
         }
     }
 
-    // ---- 全局兜底表（第三层）----
+    // ---- 全局查表（第三层）----
     //
     // 这一层**不按 |delta| 剪枝**，因此必须能查到「五五开」的对位；它正是
     // 3×3 对位表不再大面积空白的来源。
@@ -246,22 +306,23 @@ fn mock_then_analyze_produces_valid_meta() {
     let even_pairs = out
         .global_matchups
         .iter()
-        .filter(|m| m.delta.abs() < 1.0)
+        .filter(|m| m.delta_pp.abs() < 1.0)
         .count();
     for m in &out.global_matchups {
         assert!(m.a < m.b, "无序格式要求 a < b，实际 ({}, {})", m.a, m.b);
         assert!(
-            m.n >= out.params.global_matchup_min_samples,
+            m.n_eff >= out.params.global_matchup_min_eff_samples,
             "全局表条目样本不足：{} < {}",
-            m.n,
-            out.params.global_matchup_min_samples
+            m.n_eff,
+            out.params.global_matchup_min_eff_samples
         );
         assert_eq!(
-            m.delta,
-            (m.delta * 100.0).round() / 100.0,
-            "全局表 delta 应为 2 位小数"
+            m.delta_pp,
+            (m.delta_pp * 100.0).round() / 100.0,
+            "全局表 delta_pp 应为 2 位小数"
         );
-        assert!(m.delta.abs() <= 100.0, "残差不可能超过 100pp");
+        assert_eq!(m.n_eff, (m.n_eff * 10.0).round() / 10.0, "n_eff 应为 1 位小数");
+        assert!(m.delta_pp.abs() <= 100.0, "残差不可能超过 100pp");
     }
     assert!(
         even_pairs > 0,
@@ -347,12 +408,18 @@ fn mock_then_analyze_produces_valid_meta() {
 
     // JSON 序列化 / 反序列化闭环
     let json = out.to_json(false).expect("应能序列化");
-    assert!(json.len() < 4_000_000, "单文件体积应控制在 4MB 内");
+    assert!(json.len() < 16_000_000, "单文件体积应控制在 16MB 内");
     let back: MetaOutput = serde_json::from_str(&json).expect("导出的 JSON 必须能被自身解析");
     assert_eq!(back.total_battles, 2000);
     assert_eq!(back.maps.len(), out.maps.len());
     assert_eq!(back.modes.len(), out.modes.len());
     assert_eq!(back.global_matchups.len(), out.global_matchups.len());
+    for (a, b) in out.maps.iter().zip(back.maps.iter()) {
+        assert_eq!(a.matchup_table.len(), b.matchup_table.len());
+    }
+    for (a, b) in out.modes.iter().zip(back.modes.iter()) {
+        assert_eq!(a.matchup_table.len(), b.matchup_table.len());
+    }
     assert_eq!(back.schema_version, out.schema_version);
     assert!(out.to_json(true).unwrap().len() > json.len());
 }

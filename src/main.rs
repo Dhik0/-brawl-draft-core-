@@ -221,13 +221,14 @@ fn cmd_analyze(cfg: &Config, pretty: bool) -> Result<()> {
     );
 
     println!(
-        "分析完成：{} 场对局 / {} 张地图 / {} 个模式 / {} 名英雄 -> {} ({:.1} KB)",
+        "分析完成：{} 场对局 / {} 张地图 / {} 个模式 / {} 名英雄 -> {} ({:.2} MB / {} 字节)",
         meta.total_battles,
         meta.maps.len(),
         meta.modes.len(),
         meta.brawlers.len(),
         report.path.display(),
-        report.bytes as f64 / 1024.0
+        report.bytes as f64 / (1024.0 * 1024.0),
+        report.bytes
     );
 
     // 单图平均样本量：低于 500 说明过滤口径过严，导出的是稀疏数据
@@ -273,7 +274,34 @@ fn cmd_analyze(cfg: &Config, pretty: bool) -> Result<()> {
         );
     }
 
-    // 克制条目：三层各自的门槛不同，这里分行打印，避免混淆
+    // 克制条目分两套口径，必须分开打印，避免把「查表」和「展示」混为一谈：
+    //   * 查表（matchup_table / global_matchups）：无序键、每对一条、不截断、不剪枝
+    //   * 展示（brawlers[].matchups）：每英雄 Top-K + 显著性过滤
+    let map_table_entries: usize = meta.maps.iter().map(|m| m.matchup_table.len()).sum();
+    let mode_table_entries: usize = meta.modes.iter().map(|m| m.matchup_table.len()).sum();
+    let global_table_entries = meta.global_matchups.len();
+
+    let even_in = |pairs: &[brawl_draft_core::models::output::MatchupPair]| {
+        pairs.iter().filter(|m| m.delta_pp == 0.0).count()
+    };
+    let map_even: usize = meta.maps.iter().map(|m| even_in(&m.matchup_table)).sum();
+    let mode_even: usize = meta.modes.iter().map(|m| even_in(&m.matchup_table)).sum();
+    let global_even = even_in(&meta.global_matchups);
+
+    println!("3×3 对位查表（无序键 a<b / 每对一条 / 不截断 / 不按 |delta| 剪枝）：");
+    println!(
+        "          地图级 {} 条（n_eff >= {:.1}，其中均势 {} 条）",
+        map_table_entries, meta.params.map_matchup_table_min_eff_samples, map_even
+    );
+    println!(
+        "          模式级 {} 条（n_eff >= {:.1}，其中均势 {} 条）",
+        mode_table_entries, meta.params.mode_matchup_table_min_eff_samples, mode_even
+    );
+    println!(
+        "          全局级 {} 条（n_eff >= {:.1}，其中均势 {} 条）",
+        global_table_entries, meta.params.global_matchup_min_eff_samples, global_even
+    );
+
     let map_entries: usize = meta
         .maps
         .iter()
@@ -285,28 +313,12 @@ fn cmd_analyze(cfg: &Config, pretty: bool) -> Result<()> {
         .map(|m| m.brawlers.iter().map(|b| b.matchups.len()).sum::<usize>())
         .sum();
     println!(
-        "克制条目：地图级 {} 条（eff_n >= {:.0} 且 |delta| >= {:.1}pp）",
-        map_entries,
-        meta.params.matchup_min_eff_samples,
-        meta.params.matchup_min_abs_delta * 100.0
-    );
-    println!(
-        "          模式级 {} 条（eff_n >= {:.0} 且 |delta| >= {:.1}pp）",
-        mode_entries,
+        "展示列表（每英雄 Top-K，eff_n >= {:.0}/{:.0} 且 |delta| >= {:.1}pp）：地图级 {} 条 / 模式级 {} 条",
+        meta.params.map_matchup_min_samples,
         meta.params.mode_matchup_min_eff_samples,
-        meta.params.matchup_min_abs_delta * 100.0
-    );
-    // 全局兜底表：不剪枝，因此条数≈「样本够的对位数」，用于覆盖 3×3 对位空白
-    let even_pairs = meta
-        .global_matchups
-        .iter()
-        .filter(|m| m.delta.abs() < 1.0)
-        .count();
-    println!(
-        "          全局级 {} 条（n >= {}，不按 |delta| 剪枝；其中 |delta| < 1pp 的均势对位 {} 条）",
-        meta.global_matchups.len(),
-        meta.params.global_matchup_min_samples,
-        even_pairs
+        meta.params.matchup_min_abs_delta * 100.0,
+        map_entries,
+        mode_entries
     );
     println!(
         "          收缩强度 K = {:.0}（伪场次）",

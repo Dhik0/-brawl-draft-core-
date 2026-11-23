@@ -4,18 +4,31 @@
 //!
 //! ## 三级聚合
 //!
-//! * `maps[]`  —— **地图维度**：出场率、平滑胜率、综合评分、选人顺位，以及
-//!   **地图级克制列表**（`brawlers[].matchups`）。地形差异（草图 vs 开阔图）
+//! * `maps[]`  —— **地图维度**：出场率、平滑胜率、综合评分、选人顺位，
+//!   **地图级 3×3 查表**（`maps[].matchup_table`），以及面向推荐列表的
+//!   Top-K 克制展示（`maps[].brawlers[].matchups`）。地形差异（草图 vs 开阔图）
 //!   直接体现在这一层，是前端弹窗的首选数据源。
 //! * `modes[]` —— **模式维度**：同一模式（如 `brawlBall`）下各图的克制关系高度一致，
-//!   按模式聚合能把样本放大数倍，作为地图样本不足时的**先验**。
+//!   按模式聚合能把样本放大数倍，作为地图样本不足时的**先验**；
+//!   同样提供 `modes[].matchup_table`（查表）与 `brawlers[].matchups`（展示）。
 //! * `global_matchups[]` —— **全局维度**（v4 新增）：全库 1v1 去偏残差，跨模式兜底。
-//!   它**不按 `|delta|` 剪枝**，均势对位也会导出，前端因此能区分「五五开」与
-//!   「无数据」，3×3 对位表不再出现大面积空白。
+//!
+//! ## 查表 vs 展示（v5 起严格分离）
+//!
+//! | 用途 | 字段 | 截断 | 均势对位 |
+//! | --- | --- | --- | --- |
+//! | 3×3 对位查表 | `maps[].matchup_table` / `modes[].matchup_table` / `global_matchups` | **不截断** | **保留** |
+//! | 推荐列表展示 | `brawlers[].matchups` | 每英雄 Top-K | 按显著性过滤 |
+//!
+//! 查表层**只按有效样本量过滤**（地图 `n_eff >= 5.0`、模式 `n_eff >= 8.0`、
+//! 全局 `n_eff >= 6.0`），**绝不按 `|delta|` 剪枝**：`delta_pp = 0.0` 表示五五开，
+//! 与「查不到 = 无数据」有明确区别。旧实现按英雄 Top-K 截断 + 删掉 `|delta| < 1.5pp`
+//! 的条目，导致 3×3 对位大片空白、回退到全局甚至变反号——v5 彻底移除该行为。
 //!
 //! ## 克制口径
 //!
-//! `delta` 是 **地图分层去偏后的 Log5 超额胜场残差**（单位：百分点，保留 2 位小数），
+//! `delta` / `delta_pp` 是 **地图分层去偏后的 Log5 超额胜场残差**
+//! （单位：百分点，保留 2 位小数，`+4.97` 表示 `+4.97%`，**不是** `0.0497`），
 //! 不是原始胜率：
 //!
 //! ```text
@@ -31,9 +44,18 @@
 //! 且按图分层避免了跨图混合的辛普森悖论。`delta > 0` 表示 A 在对位上占优，
 //! `delta < 0` 表示 A 被克制，且严格反对称（`delta_BA = -delta_AB`）。
 //!
-//! 各层门槛：地图级 `eff_n >= 8`、模式级 `eff_n >= 12`，都要求 `|delta| >= 1.5pp`；
-//! 全局兜底表只要 `n >= 10`，不剪枝。**后端不做「正残差过大就抹零」的处理**，
-//! 绿灯绝对胜率由前端结合本图基础胜率自行兜底。
+//! 各层门槛（v5）：**只按有效样本量过滤，不按 `|delta|` 剪枝**——
+//!
+//! ```text
+//! 地图级查表  n_eff >= 5.0
+//! 模式级查表  n_eff >= 8.0
+//! 全局级查表  n_eff >= 6.0
+//! ```
+//!
+//! 门槛按 BO3 系列降权后的 `n_eff` 校准：一轮 BO3 只算 1 场，因此数值比旧版
+//! 「原始场次」口径更低。`delta_pp ≈ 0` 的均势对位只要过样本门槛就导出。
+//! 展示列表（`brawlers[].matchups`）仍保留显著性过滤，避免推荐位被噪音灌满。
+//! **后端不做「正残差过大就抹零」的处理**，绿灯绝对胜率由前端结合本图基础胜率自行兜底。
 //!
 //! ## 统计口径
 //!
@@ -57,7 +79,12 @@ use serde::{Deserialize, Serialize};
 ///   显著性门槛降为 `|delta| >= 1.5pp`。v3 的字段名全部保留。
 ///   v4 内追加（未升版，纯增量）：`Matchup.eff_samples` 给出 BO3 系列降权后的
 ///   有效样本，`delta` 与 `eff_n` 门槛同步改用降权口径。
-pub const SCHEMA_VERSION: u32 = 4;
+/// * v5：**查表与展示分离**。新增 `maps[].matchup_table` / `modes[].matchup_table`，
+///   与 `global_matchups` 统一为无序紧凑数组 `[a, b, delta_pp, n_eff]`
+///   （`a < b`、每对一条、不截断、不按 `|delta|` 剪枝，`n_eff` 保留 1 位小数）。
+///   查表门槛改为纯样本口径：地图 5.0 / 模式 8.0 / 全局 6.0。
+///   `brawlers[].matchups` 保留为 Top-K 展示列表（字段名与口径不变）。
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// 导出根节点。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,13 +106,14 @@ pub struct MetaOutput {
     pub brawlers: Vec<BrawlerRef>,
     /// 按地图聚合的结果，按 `total_games` 降序。
     pub maps: Vec<MapMeta>,
-    /// 按模式聚合的克制矩阵，按 `total_games` 降序。
+    /// 按模式聚合的结果，按 `total_games` 降序。
     pub modes: Vec<ModeMeta>,
-    /// 全局 1v1 兜底表（v4）：全库去偏残差，跨模式兜底。
+    /// 全局 1v1 查表（第三层）：全库去偏残差，跨模式兜底。
     ///
-    /// 每对英雄只存一条（`a < b`），**不按 `|delta|` 剪枝**——`delta ≈ 0` 表示
-    /// 均势对位，与「查不到 = 无数据」有明确区别。按 `(a, b)` 升序排列。
-    pub global_matchups: Vec<GlobalMatchup>,
+    /// 与 `maps[].matchup_table` / `modes[].matchup_table` 同格式：
+    /// 无序键 `a < b`、每对英雄一条、**不截断**、**不按 `|delta|` 剪枝**
+    /// （`delta_pp = 0.0` = 五五开，与「查不到 = 无数据」明确区分），按 `(a, b)` 升序。
+    pub global_matchups: Vec<MatchupPair>,
     /// 英雄定位标签配置（原样打包）。
     pub roles: RolesConfig,
 }
@@ -177,19 +205,22 @@ pub struct AnalysisParams {
     ///
     /// 字段名为 v3 兼容保留（旧版是 `C = 15`），语义已统一为分层收缩强度。
     pub matchup_smoothing_c: f64,
-    /// 导出克制条目的最小**有效样本** `eff_n`（旧字段名，语义已从原始场次改为 `eff_n`）。
-    /// v4 起等价于地图级门槛（模式级见 `mode_matchup_min_eff_samples`）。
+    /// 展示列表（`brawlers[].matchups`）的最小**有效样本** `eff_n`
+    /// （旧字段名，语义已从原始场次改为 `eff_n`）。
+    /// v4 起等价于地图级展示门槛（模式级见 `mode_matchup_min_eff_samples`）。
     pub matchup_min_samples: u32,
-    /// 地图级克制的最小有效样本（与 `matchup_min_samples` 同值）。
+    /// 地图级**展示列表**的最小有效样本（与 `matchup_min_samples` 同值）。
     pub map_matchup_min_samples: u32,
     /// v3 兼容保留：旧版「单图场次达到该值后完全信任单图」的阈值，
     /// 现由互斥分层加权取代，仅作回显。
     pub map_matchup_trust_samples: u32,
     /// 时间衰减半衰期（天），权重 `w = 0.5^(Δt / half_life)`。
     pub decay_half_life_days: f64,
-    /// 有效样本门槛（v3 兼容字段，等价于地图级门槛）。
+    /// 展示列表的有效样本门槛（v3 兼容字段，等价于地图级展示门槛）。
     pub matchup_min_eff_samples: f64,
-    /// 残差显著性门槛（`|delta| >=` 该值才导出，单位与计算口径一致：概率）。
+    /// **展示列表**的残差显著性门槛（`|delta| >=` 该值才进 Top-K，概率单位）。
+    ///
+    /// v5 起该门槛**只作用于展示列表**，查表（`matchup_table`）不受其约束。
     pub matchup_min_abs_delta: f64,
     /// 同模式其他地图的样本折算权重。
     pub same_mode_weight: f64,
@@ -199,12 +230,16 @@ pub struct AnalysisParams {
     pub other_mode_weight: f64,
     /// 其他模式折算后的样本上限。
     pub other_mode_cap: f64,
-    /// v4：模式级克制的最小有效样本 `eff_n`。
+    /// v4：模式级**展示列表**的最小有效样本 `eff_n`。
     pub mode_matchup_min_eff_samples: f64,
-    /// v4：全局兜底表的最小原始样本量 `n`。
-    pub global_matchup_min_samples: u64,
-    /// v4：全局兜底表的残差门槛，固定 `0.0` 表示**不按 `|delta|` 剪枝**。
-    pub global_matchup_min_abs_delta: f64,
+    /// v5：地图级**查表**（`maps[].matchup_table`）的最小有效样本 `n_eff`。
+    pub map_matchup_table_min_eff_samples: f64,
+    /// v5：模式级**查表**（`modes[].matchup_table`）的最小有效样本 `n_eff`。
+    pub mode_matchup_table_min_eff_samples: f64,
+    /// v5：全局级**查表**（`global_matchups`）的最小有效样本 `n_eff`。
+    pub global_matchup_min_eff_samples: f64,
+    /// v5：查表的残差门槛，恒为 `0.0`，表示**不按 `|delta|` 剪枝**（均势对位保留）。
+    pub matchup_table_min_abs_delta: f64,
 }
 
 /// 英雄字典项。
@@ -234,6 +269,12 @@ pub struct MapMeta {
     /// 前端用它去 `modes[]` 里查模式级克制先验。
     pub mode: String,
     pub total_games: u64,
+    /// **3×3 对位查表**（v5）：本图所有过样本门槛的英雄对，每对一条。
+    ///
+    /// 无序键 `a < b`，`delta_pp` 是「`a` 相对 `b`」的超额胜率残差（百分点）。
+    /// **不做按英雄 Top-K 截断、不按 `|delta|` 剪枝**——这正是 3×3 对位表
+    /// 不再空白、也不会回退到全局的原因。查 `b` 对 `a` 时取 `-delta_pp`。
+    pub matchup_table: Vec<MatchupPair>,
     /// 按 `score` 降序排列的英雄榜。
     pub brawlers: Vec<MapBrawlerStat>,
 }
@@ -257,8 +298,11 @@ pub struct MapBrawlerStat {
     pub score: f64,
     /// 选人顺位建议（依据同模式的克制矩阵 + 该图强度，按分位分配）。
     pub pick_order: PickOrder,
-    /// 该图内的克制列表：前 K 个优势对位（正 delta）+ 前 K 个劣势对位（负 delta），
+    /// **展示用**克制列表：前 K 个优势对位（正 delta）+ 前 K 个劣势对位（负 delta），
     /// 按 `delta` 降序。已按 `eff_n` / 显著性过滤，前端弹窗可直接渲染。
+    ///
+    /// 注意：这是「最佳 / 最差对手」的推荐视图，**不是** 3×3 查表数据源。
+    /// 查表请用 [`MapMeta::matchup_table`]（不截断、不按 `|delta|` 剪枝）。
     pub matchups: Vec<Matchup>,
 }
 
@@ -268,6 +312,9 @@ pub struct ModeMeta {
     /// 模式标识，如 `brawlBall` / `bounty` / `knockout`。
     pub mode: String,
     pub total_games: u64,
+    /// **3×3 对位查表**（v5）：与 `maps[].matchup_table` 同格式。
+    /// 地图级查不到时回退到这一层（样本更大、门槛更高）。
+    pub matchup_table: Vec<MatchupPair>,
     /// 按加权胜率降序排列。
     pub brawlers: Vec<ModeBrawlerStat>,
 }
@@ -287,7 +334,9 @@ pub struct ModeBrawlerStat {
     pub smoothed_wr: f64,
     /// 时间衰减加权出场率。
     pub use_rate: f64,
-    /// 模式级克制：按 |delta| 取最显著的 K 条，再按 `delta` 降序输出。
+    /// **展示用**克制列表：按 |delta| 取最显著的 K 条，再按 `delta` 降序输出。
+    ///
+    /// 3×3 查表请用 [`ModeMeta::matchup_table`]（不截断、不按 `|delta|` 剪枝）。
     pub matchups: Vec<Matchup>,
 }
 
@@ -312,40 +361,82 @@ pub struct Matchup {
     pub eff_samples: f64,
 }
 
-/// 全局 1v1 兜底记录（v4 新增，紧凑数组格式）。
+/// 无序对位记录（v5 统一格式，紧凑数组）。
 ///
-/// JSON 里序列化成 **4 元数组** `[a, b, delta, n]`（不是对象）：
+/// 地图级 / 模式级 / 全局级三张查表**共用这一种结构**。JSON 里序列化成
+/// **4 元数组**（不是对象）：
 ///
 /// ```text
-/// [1600001, 1600002, -1.25, 37]
-///  id_a      id_b     delta  n
+/// [1600001, 1600002, 4.97, 12.3]
+///  id_a      id_b     delta_pp  n_eff
 /// ```
 ///
-/// * 无序存储：恒有 `a < b`，每对英雄只有一条记录；`delta` 的方向是「`a` 对 `b`」，
-///   查 `b` 对 `a` 取相反数即可；
-/// * 用数组而非对象是为了控体积：108 名英雄约 4400 条记录，对象格式要多花 ~80KB。
+/// * **无序键**：恒有 `a < b`，每对英雄只有一条记录，从结构上杜绝重复与符号冲突；
+/// * `delta_pp` 的方向是「`a` 对 `b`」，单位是**百分点**（`4.97` = `+4.97%`），
+///   保留 2 位小数；查 `b` 对 `a` 取 `-delta_pp`，严格反对称；
+/// * `n_eff` 是该层级的**有效加权样本量**（时间衰减 × BO3 系列降权），保留 1 位小数；
+/// * 用数组而非对象是为了控体积：三层合计数万条记录，对象格式要多花数倍字节。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(into = "(i64, i64, f64, u64)", from = "(i64, i64, f64, u64)")]
-pub struct GlobalMatchup {
+#[serde(into = "(i64, i64, f64, f64)", from = "(i64, i64, f64, f64)")]
+pub struct MatchupPair {
     /// 较小的英雄 ID。
     pub a: i64,
     /// 较大的英雄 ID（恒有 `a < b`）。
     pub b: i64,
     /// `a` 对 `b` 的去偏残差（百分点，2 位小数，`0.0` = 五五开）。
-    pub delta: f64,
-    /// 全库对位有效样本（时间衰减 + BO3 系列降权后，四舍五入取整）。
-    pub n: u64,
+    pub delta_pp: f64,
+    /// 该层级的有效加权样本量（1 位小数）。
+    pub n_eff: f64,
 }
 
-impl From<(i64, i64, f64, u64)> for GlobalMatchup {
-    fn from((a, b, delta, n): (i64, i64, f64, u64)) -> Self {
-        Self { a, b, delta, n }
+impl MatchupPair {
+    /// 构造时强制规范化：`a` 取较小 ID、`b` 取较大 ID，交换时 `delta_pp` 取反。
+    ///
+    /// 所有导出路径都走这里，因此「无序键 + 严格反对称」不依赖调用方自觉。
+    pub fn canonical(x: i64, y: i64, delta_pp: f64, n_eff: f64) -> Self {
+        if x <= y {
+            Self {
+                a: x,
+                b: y,
+                delta_pp,
+                n_eff,
+            }
+        } else {
+            Self {
+                a: y,
+                b: x,
+                delta_pp: -delta_pp,
+                n_eff,
+            }
+        }
+    }
+
+    /// 查 `from` 对 `to` 的残差（百分点）。`from == to` 返回 `None`。
+    pub fn delta_of(&self, from: i64, to: i64) -> Option<f64> {
+        if from == self.a && to == self.b {
+            Some(self.delta_pp)
+        } else if from == self.b && to == self.a {
+            Some(-self.delta_pp)
+        } else {
+            None
+        }
     }
 }
 
-impl From<GlobalMatchup> for (i64, i64, f64, u64) {
-    fn from(m: GlobalMatchup) -> Self {
-        (m.a, m.b, m.delta, m.n)
+impl From<(i64, i64, f64, f64)> for MatchupPair {
+    fn from((a, b, delta_pp, n_eff): (i64, i64, f64, f64)) -> Self {
+        Self {
+            a,
+            b,
+            delta_pp,
+            n_eff,
+        }
+    }
+}
+
+impl From<MatchupPair> for (i64, i64, f64, f64) {
+    fn from(m: MatchupPair) -> Self {
+        (m.a, m.b, m.delta_pp, m.n_eff)
     }
 }
 
@@ -438,21 +529,35 @@ mod tests {
     }
 
     #[test]
-    fn global_matchup_serializes_as_compact_tuple() {
+    fn matchup_pair_serializes_as_compact_tuple() {
         // 数组格式：省掉 4 个键名，是控制 JSON 体积的关键
-        let m = GlobalMatchup {
+        let m = MatchupPair {
             a: 16_000_001,
             b: 16_000_002,
-            delta: -1.25,
-            n: 37,
+            delta_pp: -1.25,
+            n_eff: 37.4,
         };
         assert_eq!(
             serde_json::to_string(&m).unwrap(),
-            "[16000001,16000002,-1.25,37]"
+            "[16000001,16000002,-1.25,37.4]"
         );
         // 反序列化闭环
-        let back: GlobalMatchup = serde_json::from_str("[16000001,16000002,-1.25,37]").unwrap();
+        let back: MatchupPair = serde_json::from_str("[16000001,16000002,-1.25,37.4]").unwrap();
         assert_eq!(back, m);
+    }
+
+    #[test]
+    fn matchup_pair_canonicalizes_order_and_sign() {
+        // 逆序构造必须被规范化成 a < b 且 delta 取反
+        let m = MatchupPair::canonical(9, 3, 4.97, 12.3);
+        assert_eq!((m.a, m.b), (3, 9));
+        assert_eq!(m.delta_pp, -4.97);
+        assert_eq!(m.n_eff, 12.3);
+
+        // 双向查询严格反对称，且无序键保证同一对只有一条记录
+        assert_eq!(m.delta_of(9, 3), Some(4.97));
+        assert_eq!(m.delta_of(3, 9), Some(-4.97));
+        assert_eq!(m.delta_of(3, 3), None);
     }
 
     #[test]

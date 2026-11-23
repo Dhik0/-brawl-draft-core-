@@ -61,18 +61,22 @@
 //!
 //! ### 过滤与兜底
 //!
-//! 三层各有自己的门槛（`K` 统一为 20 伪场次，不再用过强的收缩把中小样本压平）：
+//! **查表（3×3）与展示（推荐位 Top-K）是两条独立路径**：
 //!
 //! ```text
-//! 地图级  eff_n >= 8   且 |delta| >= 1.5pp
-//! 模式级  eff_n >= 12  且 |delta| >= 1.5pp
-//! 全局级  n     >= 10  不按 |delta| 剪枝（保留均势对位）
+//! 查表  只按有效样本量过滤，不按 |delta| 剪枝（均势对位必须保留）
+//!       地图级 n_eff >= 5.0   模式级 n_eff >= 8.0   全局级 n_eff >= 6.0
+//! 展示  eff_n >= 8 / 12 且 |delta| >= 1.5pp，再按每英雄 Top-K 裁剪
 //! ```
 //!
-//! 地图级门槛最低，是因为单图对位天然稀薄；放宽到 `eff_n >= 8` 后，实测 3×3
-//! 对位不再有大面积空白。全局级保留 `delta ≈ 0` 的条目，前端才能区分「五五开」
-//! 和「无数据」。**后端不做任何「正残差过大就抹零」的处理**：真实克制关系原样
-//! 保留，绿灯绝对胜率由前端展示层结合本图基础胜率自行兜底。
+//! 查表门槛按 BO3 系列降权后的 `n_eff` 校准（一轮 BO3 只算 1 场），所以数值比
+//! 「原始场次」口径低。旧实现把两条路径混在一起：先按 `|delta| < 1.5pp` 删掉
+//! 均势对位、再按英雄 Top-K 截断，导致 3×3 对位大面积空白，前端回退到全局层
+//! 后符号甚至变反。现在查表层每对英雄只存一条 `[a, b, delta_pp, n_eff]`
+//! （`a < b`，`delta_pp` 属于 `a` 对 `b`），从结构上保证严格反对称。
+//!
+//! **后端不做任何「正残差过大就抹零」的处理**：真实克制关系原样保留，
+//! 绿灯绝对胜率由前端展示层结合本图基础胜率自行兜底。
 //!
 //! ## 综合评分（`score`）
 //!
@@ -137,9 +141,9 @@ use rayon::prelude::*;
 
 use crate::db::{parse_battle_time, BattleRow};
 use crate::models::output::{
-    tier_label, AnalysisParams, BrawlerRef, GlobalMatchup, MapBrawlerStat, MapMeta, Matchup,
-    MetaOutput,
-    ModeBrawlerStat, ModeMeta, PickOrder, RolesConfig, TierAudit, TierBucket, SCHEMA_VERSION,
+    tier_label, AnalysisParams, BrawlerRef, MapBrawlerStat, MapMeta, Matchup, MatchupPair,
+    MetaOutput, ModeBrawlerStat, ModeMeta, PickOrder, RolesConfig, TierAudit, TierBucket,
+    SCHEMA_VERSION,
 };
 
 /// 综合评分中胜率项的权重（其余给对数压缩后的出场率）。
@@ -183,23 +187,29 @@ pub const SAME_MODE_SAMPLE_CAP: f64 = 40.0;
 pub const OTHER_MODE_SAMPLE_WEIGHT: f64 = 0.3;
 /// 其他模式折算后的样本上限。
 pub const OTHER_MODE_SAMPLE_CAP: f64 = 25.0;
-/// 地图级克制条目的最小有效样本 `eff_n`。
+/// 地图级**展示列表**（`brawlers[].matchups`）的最小有效样本 `eff_n`。
 ///
-/// 单图对位天然稀薄，门槛比模式级更低——这是覆盖率的主要来源。
+/// 只影响推荐位展示，**不影响 3×3 查表**（查表用 [`MAP_MATCHUP_TABLE_MIN_EFF`]）。
 pub const MAP_MATCHUP_MIN_EFF_SAMPLES: f64 = 8.0;
-/// 模式级克制条目的最小有效样本 `eff_n`。
+/// 模式级**展示列表**的最小有效样本 `eff_n`。
 ///
-/// 模式层样本比单图大数倍，门槛相应抬高，避免整张模式表被噪音灌满。
+/// 同样只影响展示；查表用 [`MODE_MATCHUP_TABLE_MIN_EFF`]。
 pub const MODE_MATCHUP_MIN_EFF_SAMPLES: f64 = 12.0;
-/// 地图级 / 模式级克制条目的最小残差绝对值（概率单位，`0.015` = 1.5pp）。
-pub const MIN_MATCHUP_ABS_DELTA: f64 = 0.015;
-/// 全局兜底表的最小原始对位样本量。
+/// **展示列表**的最小残差绝对值（概率单位，`0.015` = 1.5pp）。
 ///
-/// 全局表**不按 `|delta|` 剪枝**：均势对位（`delta ≈ 0`）也要导出，前端才能
-/// 把「五五开」和「无数据」区分开。
-pub const GLOBAL_MATCHUP_MIN_SAMPLES: u64 = 10;
-/// 全局兜底表的残差门槛，固定为 0（不剪枝）。
-pub const GLOBAL_MATCHUP_MIN_ABS_DELTA: f64 = 0.0;
+/// v5 起该门槛**只作用于展示列表**：查表严禁按 `|delta|` 剪枝，否则均势对位
+/// 会被误删，前端无法区分「五五开」与「无数据」。
+pub const MIN_MATCHUP_ABS_DELTA: f64 = 0.015;
+
+/// 地图级 **3×3 查表**的最小有效样本 `n_eff`。
+///
+/// 只按样本过滤：`n_eff >= 5.0` 即导出，`delta_pp = 0.0` 的均势对位也保留。
+/// 门槛按 BO3 系列降权后的有效样本校准（一轮 BO3 只算 1 场）。
+pub const MAP_MATCHUP_TABLE_MIN_EFF: f64 = 5.0;
+/// 模式级 **3×3 查表**的最小有效样本 `n_eff`。
+pub const MODE_MATCHUP_TABLE_MIN_EFF: f64 = 8.0;
+/// 全局级 **3×3 查表**（`global_matchups`）的最小有效样本 `n_eff`。
+pub const GLOBAL_MATCHUP_TABLE_MIN_EFF: f64 = 6.0;
 
 /// 时间衰减的默认半衰期（天）。
 pub const DEFAULT_DECAY_HALF_LIFE_DAYS: f64 = 30.0;
@@ -371,8 +381,11 @@ pub fn analyze(
             other_mode_weight: OTHER_MODE_SAMPLE_WEIGHT,
             other_mode_cap: OTHER_MODE_SAMPLE_CAP,
             mode_matchup_min_eff_samples: MODE_MATCHUP_MIN_EFF_SAMPLES,
-            global_matchup_min_samples: GLOBAL_MATCHUP_MIN_SAMPLES,
-            global_matchup_min_abs_delta: GLOBAL_MATCHUP_MIN_ABS_DELTA,
+            map_matchup_table_min_eff_samples: MAP_MATCHUP_TABLE_MIN_EFF,
+            mode_matchup_table_min_eff_samples: MODE_MATCHUP_TABLE_MIN_EFF,
+            global_matchup_min_eff_samples: GLOBAL_MATCHUP_TABLE_MIN_EFF,
+            // 查表不按 |delta| 剪枝：均势对位必须保留
+            matchup_table_min_abs_delta: 0.0,
         },
         brawlers: build_brawler_refs(&kept, brawler_dict),
         maps,
@@ -697,9 +710,10 @@ pub fn hierarchical_delta(
     (delta, eff_n)
 }
 
-/// 导出门槛：有效样本达到该层门槛、且残差足够显著。
+/// **展示列表**的导出门槛：有效样本达到该层展示门槛、且残差足够显著。
 ///
-/// 地图级与模式级的 `min_eff` 不同（见模块文档），显著性门槛共用。
+/// v5 起只用于 `brawlers[].matchups`（推荐位 Top-K）。3×3 查表另走
+/// [`to_matchup_table`]：只按 `n_eff` 过滤，**不按 `|delta|` 剪枝**。
 fn passes_export_filter(delta: f64, eff_n: f64, min_eff: f64) -> bool {
     eff_n >= min_eff && delta.abs() >= MIN_MATCHUP_ABS_DELTA
 }
@@ -817,15 +831,28 @@ fn aggregate_excess(
 // 克制残差（导出用，单位：百分点）
 // ---------------------------------------------------------------------------
 
-/// 单张地图的克制残差矩阵：`(A, B) -> delta_pp`，已过滤噪音并双向镜像。
-fn map_deltas(
+/// 单条对位的分层残差（规范方向 `lo < hi`，未镜像、未乘 100）。
+#[derive(Debug, Clone, Copy)]
+struct DeltaEntry {
+    /// 概率残差（`lo` 对 `hi`），导出时 ×100 记作百分点。
+    delta: f64,
+    /// 折算后的有效样本量（时间衰减 × BO3 系列降权）。
+    eff_n: f64,
+}
+
+/// 单张地图的规范方向对位残差，**只按查表样本门槛过滤**。
+///
+/// 关键：这里**不看 `|delta|`**。旧实现同时删掉 `|delta| < 1.5pp` 的均势对位，
+/// 结果 3×3 表里「五五开」被当成「无数据」，前端回退到模式 / 全局层，
+/// 样本口径一变符号就可能反。查表层必须把均势对位原样留下。
+fn map_delta_entries(
     core: &MapCore,
     mode_idx: usize,
     mode_excess: &HashMap<ModePairKey, Stratum>,
     global_excess: &HashMap<PairKey, Stratum>,
     k: f64,
-) -> HashMap<PairKey, f64> {
-    let mut out: HashMap<PairKey, f64> = HashMap::with_capacity(core.excess.len() * 2);
+) -> HashMap<PairKey, DeltaEntry> {
+    let mut out: HashMap<PairKey, DeltaEntry> = HashMap::with_capacity(core.excess.len());
 
     for ((lo, hi), s1) in &core.excess {
         let m = mode_excess.get(&(mode_idx, *lo, *hi)).copied().unwrap_or(*s1);
@@ -841,26 +868,25 @@ fn map_deltas(
             g.e - m.e,
             k,
         );
-        if !passes_export_filter(delta, eff_n, MAP_MATCHUP_MIN_EFF_SAMPLES) {
+        if eff_n < MAP_MATCHUP_TABLE_MIN_EFF {
             continue;
         }
-        let pp = round2(delta * 100.0);
-        out.insert((*lo, *hi), pp);
-        // 精确镜像，保证 delta_BA == -delta_AB
-        out.insert((*hi, *lo), -pp);
+        out.insert((*lo, *hi), DeltaEntry { delta, eff_n });
     }
 
     out
 }
 
-/// 模式层的克制残差：把「本图」换成「整个模式」，其他模式作为外部先验。
-fn mode_deltas(
+/// 模式层的规范方向对位残差（整模式为本层，其他模式为外部先验）。
+///
+/// 与地图层一致：**只按查表样本门槛过滤，不按 `|delta|` 剪枝**。
+fn mode_delta_entries(
     mode_idx: usize,
     mode_excess: &HashMap<ModePairKey, Stratum>,
     global_excess: &HashMap<PairKey, Stratum>,
     k: f64,
-) -> HashMap<PairKey, f64> {
-    let mut out: HashMap<PairKey, f64> = HashMap::new();
+) -> HashMap<PairKey, DeltaEntry> {
+    let mut out: HashMap<PairKey, DeltaEntry> = HashMap::new();
 
     for ((mi, lo, hi), s) in mode_excess {
         if *mi != mode_idx {
@@ -876,45 +902,72 @@ fn mode_deltas(
             g.e - s.e,
             k,
         );
-        if !passes_export_filter(delta, eff_n, MODE_MATCHUP_MIN_EFF_SAMPLES) {
+        if eff_n < MODE_MATCHUP_TABLE_MIN_EFF {
             continue;
         }
-        let pp = round2(delta * 100.0);
-        out.insert((*lo, *hi), pp);
-        out.insert((*hi, *lo), -pp);
+        out.insert((*lo, *hi), DeltaEntry { delta, eff_n });
     }
 
     out
 }
 
-/// 全局 1v1 兜底表（第三层）：全库去偏残差，**不按 `|delta|` 剪枝**。
+/// 规范方向的残差 → **展示列表**用的有向查找表（双向镜像 + 显著性过滤）。
+///
+/// 展示列表只服务「最佳 / 最差对手」推荐位，按 `eff_n` 与 `|delta|` 过滤后
+/// 再做 Top-K 裁剪；查表数据不走这里，因此两者互不影响。
+fn mirror_display_deltas(
+    entries: &HashMap<PairKey, DeltaEntry>,
+    min_eff: f64,
+) -> HashMap<PairKey, f64> {
+    let mut out: HashMap<PairKey, f64> = HashMap::with_capacity(entries.len() * 2);
+    for ((lo, hi), e) in entries {
+        if !passes_export_filter(e.delta, e.eff_n, min_eff) {
+            continue;
+        }
+        let pp = round2(e.delta * 100.0);
+        out.insert((*lo, *hi), pp);
+        // 精确镜像，保证 delta_BA == -delta_AB
+        out.insert((*hi, *lo), -pp);
+    }
+    out
+}
+
+/// 规范方向的残差 → **查表**用的无序紧凑数组。
+///
+/// * 每对英雄一条（`a < b`），`delta_pp` 属于 `a` 对 `b`；
+/// * **不截断、不按 `|delta|` 剪枝**：`delta_pp = 0.0` 的均势对位照样导出；
+/// * `n_eff` 保留 1 位小数，`delta_pp` 保留 2 位小数；
+/// * 按 `(a, b)` 升序，保证导出文件稳定可 diff。
+fn to_matchup_table(entries: &HashMap<PairKey, DeltaEntry>) -> Vec<MatchupPair> {
+    let mut out: Vec<MatchupPair> = entries
+        .iter()
+        .map(|((lo, hi), e)| {
+            MatchupPair::canonical(*lo, *hi, round2(e.delta * 100.0), round1(e.eff_n))
+        })
+        .collect();
+    out.sort_by_key(|m| (m.a, m.b));
+    out
+}
+
+/// 全局 1v1 查表（第三层）：全库去偏残差，**只按 `n_eff` 过滤**。
 ///
 /// * 只用规范方向 `lo < hi`，每对英雄一条记录；
-/// * 门槛只有样本 `n >= GLOBAL_MATCHUP_MIN_SAMPLES`（`n` 是 BO3 降权后的有效样本），
-///   `delta ≈ 0` 的均势对位也会保留——这正是前端区分「五五开」与「无数据」的依据；
+/// * 门槛 `n_eff >= GLOBAL_MATCHUP_TABLE_MIN_EFF`（BO3 降权后的有效样本），
+///   `delta_pp ≈ 0` 的均势对位也会保留——这正是前端区分「五五开」与「无数据」的依据；
 /// * 收缩口径与地图/模式层一致：`delta = Σe / (n + K)`，保证三层同尺度；
 /// * 输出按 `(lo, hi)` 排序，保证导出文件稳定可 diff。
 fn build_global_matchups(
     global_excess: &HashMap<PairKey, Stratum>,
     k: f64,
-) -> Vec<GlobalMatchup> {
-    let mut out: Vec<GlobalMatchup> = global_excess
+) -> Vec<MatchupPair> {
+    let mut out: Vec<MatchupPair> = global_excess
         .iter()
         .filter_map(|((lo, hi), s)| {
-            let n = s.n.round() as u64;
-            if n < GLOBAL_MATCHUP_MIN_SAMPLES {
+            if s.n < GLOBAL_MATCHUP_TABLE_MIN_EFF {
                 return None;
             }
             let delta_pp = round2(s.e / (s.n + k.max(0.0)) * 100.0);
-            if delta_pp.abs() < GLOBAL_MATCHUP_MIN_ABS_DELTA {
-                return None;
-            }
-            Some(GlobalMatchup {
-                a: *lo,
-                b: *hi,
-                delta: delta_pp,
-                n,
-            })
+            Some(MatchupPair::canonical(*lo, *hi, delta_pp, round1(s.n)))
         })
         .collect();
     out.sort_by_key(|m| (m.a, m.b));
@@ -1009,12 +1062,15 @@ fn build_mode(
         }
     }
 
-    let delta = mode_deltas(mode_idx, mode_excess, global_excess, opts.matchup_prior_k);
+    // 规范方向残差：查表用（只按 n_eff 过滤，均势对位保留）
+    let entries = mode_delta_entries(mode_idx, mode_excess, global_excess, opts.matchup_prior_k);
+    // 展示列表用（有向镜像 + 显著性过滤），与查表互不影响
+    let display_delta = mirror_display_deltas(&entries, MODE_MATCHUP_MIN_EFF_SAMPLES);
 
     let mut brawlers: Vec<ModeBrawlerStat> = acc
         .iter()
         .map(|(id, a)| {
-            let mut matchups = matchups_of(*id, &pairs, &delta);
+            let mut matchups = matchups_of(*id, &pairs, &display_delta);
             // 先按显著度取 Top K，再按强度排序，兼顾体积与可读性
             matchups.sort_by(|x, y| {
                 y.delta
@@ -1050,6 +1106,7 @@ fn build_mode(
     ModeMeta {
         mode: mode.to_string(),
         total_games,
+        matchup_table: to_matchup_table(&entries),
         brawlers,
     }
 }
@@ -1078,10 +1135,13 @@ fn build_map(
     opts: &AnalyzeOptions,
 ) -> MapMeta {
     // 本图 delta：本图残差为主，同模式 / 其他模式按互斥权重做先验
-    let delta = map_deltas(core, mode_idx, mode_excess, global_excess, opts.matchup_prior_k);
+    let entries = map_delta_entries(core, mode_idx, mode_excess, global_excess, opts.matchup_prior_k);
+    // 展示列表用（有向镜像 + 显著性过滤）；查表用 entries，互不影响
+    let display_delta = mirror_display_deltas(&entries, MAP_MATCHUP_MIN_EFF_SAMPLES);
 
-    // 本图对位画像：顺位判定只看这张图上已导出的克制关系
-    let map_profiles = extract_profiles(&core.pairs, &delta);
+    // 本图对位画像：顺位判定只看这张图上**显著**的克制关系（口径与 v4 一致，
+    // 不能把均势对位算进来，否则 FIRST / LAST 的分位会被摊平）
+    let map_profiles = extract_profiles(&core.pairs, &display_delta);
 
     let max_use = core
         .acc
@@ -1138,7 +1198,7 @@ fn build_map(
                 .unwrap_or(0.0);
             let flex = smoothed - FLEX_PENALTY * penalty;
 
-            let mut matchups = matchups_of(id, &core.pairs, &delta);
+            let mut matchups = matchups_of(id, &core.pairs, &display_delta);
             let edge_count = matchups.len();
             truncate_matchups(&mut matchups);
 
@@ -1177,6 +1237,8 @@ fn build_map(
         map_name: core.map_name.clone(),
         mode: core.mode.clone(),
         total_games: core.total_games,
+        // 3×3 查表：全部过样本门槛的英雄对，每对一条，不截断、不按 |delta| 剪枝
+        matchup_table: to_matchup_table(&entries),
         brawlers,
     }
 }
@@ -1418,6 +1480,19 @@ fn round2(v: f64) -> f64 {
         return 0.0;
     }
     let r = (v * 100.0).round() / 100.0;
+    if r == 0.0 {
+        0.0
+    } else {
+        r
+    }
+}
+
+/// 保留 1 位小数（查表的 `n_eff`），并把 `-0.0` 归一成 `0.0`。
+fn round1(v: f64) -> f64 {
+    if !v.is_finite() {
+        return 0.0;
+    }
+    let r = (v * 10.0).round() / 10.0;
     if r == 0.0 {
         0.0
     } else {
@@ -1715,29 +1790,197 @@ mod tests {
         let mut excess: HashMap<PairKey, Stratum> = HashMap::new();
         // 均势对位：n 够、残差极小 -> 必须保留（前端据此判「五五开」）
         excess.insert((1, 2), Stratum { n: 400.0, e: 0.5 });
-        // 薄样本：n < 10 -> 丢弃
-        excess.insert((1, 3), Stratum { n: 9.0, e: 5.0 });
+        // 薄样本：n_eff = 5.9 < 6.0 -> 丢弃
+        excess.insert((1, 3), Stratum { n: 5.9, e: 5.0 });
         // 强克制：n 够 -> 保留，delta = e / (n + K)
         excess.insert((2, 3), Stratum { n: 100.0, e: 20.0 });
+        // 恰好过门槛：n_eff = 6.0 -> 保留（边界必须闭合）
+        excess.insert((2, 4), Stratum { n: 6.0, e: 0.0 });
 
         let out = build_global_matchups(&excess, MATCHUP_PRIOR_K);
-        assert_eq!(out.len(), 2, "n < 10 的条目必须被丢弃，均势对位必须保留");
+        assert_eq!(out.len(), 3, "n_eff < 6.0 的条目必须被丢弃，均势对位必须保留");
 
-        // 按 (a, b) 升序，且恒有 a < b
+        // 按 (a, b) 升序，且恒有 a < b、无重复
         assert!(out.windows(2).all(|w| (w[0].a, w[0].b) < (w[1].a, w[1].b)));
         assert!(out.iter().all(|m| m.a < m.b));
 
         let even = out.iter().find(|m| (m.a, m.b) == (1, 2)).unwrap();
-        assert_eq!(even.n, 400);
+        assert_eq!(even.n_eff, 400.0);
         assert!(
-            even.delta.abs() < 0.5,
+            even.delta_pp.abs() < 0.5,
             "均势对位的残差应接近 0 但仍被导出（区别于无数据），实际 {}",
-            even.delta
+            even.delta_pp
         );
 
         let strong = out.iter().find(|m| (m.a, m.b) == (2, 3)).unwrap();
-        assert!((strong.delta - round2(20.0 / 120.0 * 100.0)).abs() < 1e-9);
-        assert_eq!(strong.n, 100);
+        assert!(
+            (strong.delta_pp - round2(20.0 / 120.0 * 100.0)).abs() < 1e-9,
+            "delta_pp 必须是百分点，实际 {}",
+            strong.delta_pp
+        );
+        assert_eq!(strong.n_eff, 100.0);
+
+        let boundary = out.iter().find(|m| (m.a, m.b) == (2, 4)).unwrap();
+        assert_eq!(boundary.delta_pp, 0.0, "残差为 0 也必须保留");
+    }
+
+    #[test]
+    fn matchup_table_is_unordered_unique_and_not_truncated() {
+        // 30 个对手、delta 覆盖正负与 0：查表必须全量导出，且无序键唯一
+        let mut entries: HashMap<PairKey, DeltaEntry> = HashMap::new();
+        for i in 0..30 {
+            entries.insert(
+                (1, 100 + i),
+                DeltaEntry {
+                    delta: (i as f64 - 15.0) / 100.0,
+                    eff_n: 12.34,
+                },
+            );
+        }
+
+        let table = to_matchup_table(&entries);
+        assert_eq!(table.len(), 30, "查表严禁按英雄 Top-K 截断");
+        assert!(table.iter().all(|m| m.a < m.b), "必须是无序键 a < b");
+        assert!(
+            table.windows(2).all(|w| (w[0].a, w[0].b) < (w[1].a, w[1].b)),
+            "必须按 (a, b) 升序且无重复"
+        );
+        assert!(
+            table.iter().any(|m| m.delta_pp == 0.0),
+            "均势对位（delta_pp = 0.0）必须保留"
+        );
+        assert!(
+            table.iter().all(|m| m.n_eff == 12.3),
+            "n_eff 必须保留 1 位小数"
+        );
+        // 单位必须是百分点：概率 0.0497 要导出成 4.97，不能原样写 0.0497
+        let unit = to_matchup_table(&HashMap::from([(
+            (7, 8),
+            DeltaEntry {
+                delta: 0.0497,
+                eff_n: 20.04,
+            },
+        )]));
+        assert_eq!(unit[0].delta_pp, 4.97);
+        assert_eq!(unit[0].n_eff, 20.0, "n_eff 保留 1 位小数");
+
+        // 对照：展示列表同规模数据会被 Top-K 截断，查表不受影响
+        let mut display: Vec<Matchup> = table
+            .iter()
+            .map(|m| Matchup {
+                opponent: m.b,
+                delta: m.delta_pp,
+                samples: 20,
+                eff_samples: 12.3,
+            })
+            .collect();
+        truncate_matchups(&mut display);
+        assert!(display.len() < table.len(), "展示列表应被截断");
+    }
+
+    #[test]
+    fn even_map_matchup_survives_in_table_but_not_in_display_list() {
+        // 10 场 5 胜 5 负、双方只打过对方：基础胜率都是 0.5，Log5 残差精确为 0
+        let mut battles = Vec::new();
+        for i in 0..10i64 {
+            let t = shift_time(i * TEST_STEP_SECS);
+            let (w, l) = if i < 5 {
+                ([1, 10, 11], [2, 12, 13])
+            } else {
+                ([2, 12, 13], [1, 10, 11])
+            };
+            let mut r = row_at("M", "brawlBall", &t, w, l);
+            r.battle_hash = format!("e{i}");
+            battles.push(r);
+        }
+
+        let out = analyze(&battles, &dict(&ALL), &opts());
+        let map = find_map(&out, "M");
+
+        // 查表：n_eff = 10 >= 5，delta_pp = 0.0 -> 必须保留（五五开 ≠ 无数据）
+        let pair = map
+            .matchup_table
+            .iter()
+            .find(|m| (m.a, m.b) == (1, 2))
+            .expect("均势对位必须出现在地图级查表里");
+        assert_eq!(pair.delta_pp, 0.0);
+        assert!((pair.n_eff - 10.0).abs() < 1e-9);
+        assert_eq!(pair.delta_of(2, 1), Some(0.0));
+
+        // 展示列表：|delta| < 1.5pp 被显著性过滤（推荐位不该塞五五开）
+        assert!(
+            matchup_on_map(map, 1, 2).is_none(),
+            "均势对位不应进入推荐位展示列表"
+        );
+    }
+
+    #[test]
+    fn map_table_threshold_is_five_effective_samples() {
+        // 4 场：n_eff = 4 < 5 -> 查表也不导出
+        let thin = counter_ladder("M", "brawlBall", 4, "t");
+        let out = analyze(&thin, &dict(&ALL), &opts());
+        assert!(
+            find_map(&out, "M")
+                .matchup_table
+                .iter()
+                .all(|m| (m.a, m.b) != (1, 2)),
+            "n_eff < 5.0 的对位不得进入查表"
+        );
+
+        // 6 场：n_eff = 6 >= 5 -> 查表导出（旧口径 eff_n >= 8 会漏掉）
+        let mid = counter_ladder("M", "brawlBall", 6, "m");
+        let out = analyze(&mid, &dict(&ALL), &opts());
+        let pair = find_map(&out, "M")
+            .matchup_table
+            .iter()
+            .find(|m| (m.a, m.b) == (1, 2))
+            .expect("n_eff = 6 应通过地图级查表门槛");
+        assert!((pair.n_eff - 6.0).abs() < 1e-9);
+        assert!(pair.delta_pp > 0.0, "A 稳吃 B，残差应为正");
+    }
+
+    #[test]
+    fn map_table_matches_display_delta_but_is_never_mirrored_twice() {
+        let battles = counter_ladder("M", "hotZone", 25, "h");
+        let out = analyze(&battles, &dict(&ALL), &opts());
+        let map = find_map(&out, "M");
+
+        // 同一对英雄在查表里只有一条记录（a < b），镜像由读取方取负号
+        let hits: Vec<_> = map
+            .matchup_table
+            .iter()
+            .filter(|m| (m.a, m.b) == (1, 2))
+            .collect();
+        assert_eq!(hits.len(), 1, "无序键要求每对英雄只存一条");
+        assert_eq!(hits[0].delta_of(2, 1), Some(-hits[0].delta_pp));
+
+        // 与展示列表口径一致（同一套分层残差，只是过滤条件不同）
+        let shown = matchup_on_map(map, 1, 2).expect("显著对位应进入展示列表");
+        assert_eq!(hits[0].delta_pp, shown.delta);
+        assert!((hits[0].n_eff - round1(shown.eff_samples)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn mode_table_threshold_is_eight_effective_samples() {
+        // 模式级查表门槛 8：6 场阶梯（eff_n = 6）不得进入模式表
+        let battles = counter_ladder("M", "brawlBall", 6, "m");
+        let out = analyze(&battles, &dict(&ALL), &opts());
+        let mode = find_mode(&out, "brawlBall");
+        assert!(
+            mode.matchup_table
+                .iter()
+                .all(|m| (m.a, m.b) != (1, 2)),
+            "n_eff < 8.0 的对位不得进入模式级查表"
+        );
+
+        // 10 场（eff_n = 10）-> 进入模式表
+        let battles = counter_ladder("M", "brawlBall", 10, "m");
+        let out = analyze(&battles, &dict(&ALL), &opts());
+        let mode = find_mode(&out, "brawlBall");
+        assert!(
+            mode.matchup_table.iter().any(|m| (m.a, m.b) == (1, 2)),
+            "n_eff = 10 应通过模式级查表门槛"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1983,12 +2226,13 @@ mod tests {
 
     #[test]
     fn map_matchup_needs_enough_eff_samples() {
-        // 5 场：eff_n = 5 < 8，即使残差 9.1pp 也不导出
+        // 5 场：eff_n = 5 < 8，展示列表不导出（查表层门槛是 5.0，另见
+        // `map_table_threshold_is_five_effective_samples`）
         let thin = counter_ladder("M", "brawlBall", 5, "t");
         let out = analyze(&thin, &dict(&ALL), &opts());
         assert!(
             matchup_on_map(find_map(&out, "M"), 1, 2).is_none(),
-            "eff_n 不足的条目必须被剔除"
+            "展示列表的 eff_n 门槛不足时必须剔除"
         );
 
         // 10 场：eff_n = 10 >= 8，残差 13.89pp，放行（旧口径 eff_n >= 15 会漏掉）

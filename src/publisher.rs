@@ -104,13 +104,13 @@ fn run_git(args: &[&str]) -> Result<String> {
 mod tests {
     use super::*;
     use crate::models::output::{
-        AnalysisParams, BrawlerRef, GlobalMatchup, MapBrawlerStat, MapMeta, Matchup,
+        AnalysisParams, BrawlerRef, MapBrawlerStat, MapMeta, Matchup, MatchupPair,
         ModeBrawlerStat, ModeMeta, PickOrder, RolesConfig, TierAudit, TierBucket,
     };
 
     fn sample_meta() -> MetaOutput {
         MetaOutput {
-            schema_version: 4,
+            schema_version: 5,
             updated_at: "2026-11-21T00:00:00Z".to_string(),
             season_start: "2026-07-20".to_string(),
             total_battles: 42,
@@ -140,8 +140,10 @@ mod tests {
                 other_mode_weight: 0.3,
                 other_mode_cap: 25.0,
                 mode_matchup_min_eff_samples: 12.0,
-                global_matchup_min_samples: 10,
-                global_matchup_min_abs_delta: 0.0,
+                map_matchup_table_min_eff_samples: 5.0,
+                mode_matchup_table_min_eff_samples: 8.0,
+                global_matchup_min_eff_samples: 6.0,
+                matchup_table_min_abs_delta: 0.0,
             },
             brawlers: vec![
                 BrawlerRef {
@@ -157,6 +159,12 @@ mod tests {
                 map_name: "Center Stage".to_string(),
                 mode: "brawlBall".to_string(),
                 total_games: 42,
+                matchup_table: vec![MatchupPair {
+                    a: 16_000_000,
+                    b: 16_000_001,
+                    delta_pp: 14.48,
+                    n_eff: 9.0,
+                }],
                 brawlers: vec![MapBrawlerStat {
                     id: 16_000_000,
                     name: "Shelly".to_string(),
@@ -178,6 +186,12 @@ mod tests {
             modes: vec![ModeMeta {
                 mode: "brawlBall".to_string(),
                 total_games: 42,
+                matchup_table: vec![MatchupPair {
+                    a: 16_000_000,
+                    b: 16_000_001,
+                    delta_pp: 14.48,
+                    n_eff: 9.0,
+                }],
                 brawlers: vec![ModeBrawlerStat {
                     id: 16_000_000,
                     name: "Shelly".to_string(),
@@ -194,11 +208,11 @@ mod tests {
                     }],
                 }],
             }],
-            global_matchups: vec![GlobalMatchup {
+            global_matchups: vec![MatchupPair {
                 a: 16_000_000,
                 b: 16_000_001,
-                delta: 14.48,
-                n: 18,
+                delta_pp: 14.48,
+                n_eff: 18.0,
             }],
             roles: RolesConfig {
                 version: 1,
