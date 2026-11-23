@@ -2,13 +2,16 @@
 //!
 //! 体积优先：所有浮点指标保留 4 位小数，克制关系保留 2 位小数且按强度截断。
 //!
-//! ## 两级聚合
+//! ## 三级聚合
 //!
 //! * `maps[]`  —— **地图维度**：出场率、平滑胜率、综合评分、选人顺位，以及
 //!   **地图级克制列表**（`brawlers[].matchups`）。地形差异（草图 vs 开阔图）
 //!   直接体现在这一层，是前端弹窗的首选数据源。
 //! * `modes[]` —— **模式维度**：同一模式（如 `brawlBall`）下各图的克制关系高度一致，
 //!   按模式聚合能把样本放大数倍，作为地图样本不足时的**先验**。
+//! * `global_matchups[]` —— **全局维度**（v4 新增）：全库 1v1 去偏残差，跨模式兜底。
+//!   它**不按 `|delta|` 剪枝**，均势对位也会导出，前端因此能区分「五五开」与
+//!   「无数据」，3×3 对位表不再出现大面积空白。
 //!
 //! ## 克制口径
 //!
@@ -21,22 +24,26 @@
 //! 同模式其他图 e2    = E_mode - e1                // 已扣除本图，不重复计数
 //! 其他模式    e3    = E_global - E_mode           // 已扣除本模式，不重复计数
 //! 折算      n2_eff = min(0.6*n2, 40), n3_eff = min(0.3*n3, 25)
-//! delta    = (e1 + e2_eff + e3_eff) / (n1 + n2_eff + n3_eff + 50) * 100
+//! delta    = (e1 + e2_eff + e3_eff) / (n1 + n2_eff + n3_eff + 20) * 100
 //! ```
 //!
 //! 这样扣掉了「英雄本身强度」带来的胜率红利，只留下**对位关系本身**的贡献，
 //! 且按图分层避免了跨图混合的辛普森悖论。`delta > 0` 表示 A 在对位上占优，
 //! `delta < 0` 表示 A 被克制，且严格反对称（`delta_BA = -delta_AB`）。
 //!
-//! 只导出 `eff_n >= 15` 且 `|delta| >= 2pp` 的条目；**后端不做「正残差过大就
-//! 抹零」的处理**，绿灯绝对胜率由前端结合本图基础胜率自行兜底。
+//! 各层门槛：地图级 `eff_n >= 8`、模式级 `eff_n >= 12`，都要求 `|delta| >= 1.5pp`；
+//! 全局兜底表只要 `n >= 10`，不剪枝。**后端不做「正残差过大就抹零」的处理**，
+//! 绿灯绝对胜率由前端结合本图基础胜率自行兜底。
 //!
 //! ## 统计口径
 //!
-//! `games` / `wins` 是**原始计数**（便于展示样本量），
-//! `win_rate` / `smoothed_wr` / `use_rate` 是**时间衰减加权后**的比率，
+//! `games` / `wins` / `total_games` 是**原始计数**（便于展示样本量），
+//! `win_rate` / `smoothed_wr` / `use_rate` 是**时间衰减 × BO3 系列降权后**的比率，
 //! 因此 `wins / games` 不会精确等于 `win_rate`。
-//! 克制层（`delta` / `samples`）则统一使用**原始计数**，与公式完全一致、可手算复核。
+//!
+//! 传奇排位是 BO3：同一批 6 人在 10 分钟内连打 2~3 小局，若每个小局都算独立样本，
+//! 有效样本会虚高 2~3 倍。`Matchup.eff_samples` 因此是降权后的有效样本
+//! （一轮 3 局 BO3 合计 `1.0`），`Matchup.samples` 仍是原始场次。
 
 use serde::{Deserialize, Serialize};
 
@@ -45,9 +52,12 @@ use serde::{Deserialize, Serialize};
 /// * v2：克制矩阵从地图维度迁移到模式维度，`Matchup` 增加 `smoothed_wr`。
 /// * v3：克制改为 **Log5 残差 delta**（`opponent` / `delta` / `samples`），
 ///   地图级也导出克制列表；新增段位审计 `tier_audit`。
-///   v3 的字段结构保持不变，但克制残差的计算已升级为「地图分层去偏 + 互斥分层
-///   贝叶斯平滑」（见模块文档），`delta` 仍以百分点表示。
-pub const SCHEMA_VERSION: u32 = 3;
+/// * v4：新增全局 1v1 兜底表 `global_matchups`（不按 `|delta|` 剪枝）；收缩强度
+///   `K` 由 50 降到 20，地图级 / 模式级门槛拆分为 `eff_n >= 8` / `12`，
+///   显著性门槛降为 `|delta| >= 1.5pp`。v3 的字段名全部保留。
+///   v4 内追加（未升版，纯增量）：`Matchup.eff_samples` 给出 BO3 系列降权后的
+///   有效样本，`delta` 与 `eff_n` 门槛同步改用降权口径。
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// 导出根节点。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +81,11 @@ pub struct MetaOutput {
     pub maps: Vec<MapMeta>,
     /// 按模式聚合的克制矩阵，按 `total_games` 降序。
     pub modes: Vec<ModeMeta>,
+    /// 全局 1v1 兜底表（v4）：全库去偏残差，跨模式兜底。
+    ///
+    /// 每对英雄只存一条（`a < b`），**不按 `|delta|` 剪枝**——`delta ≈ 0` 表示
+    /// 均势对位，与「查不到 = 无数据」有明确区别。按 `(a, b)` 升序排列。
+    pub global_matchups: Vec<GlobalMatchup>,
     /// 英雄定位标签配置（原样打包）。
     pub roles: RolesConfig,
 }
@@ -163,6 +178,7 @@ pub struct AnalysisParams {
     /// 字段名为 v3 兼容保留（旧版是 `C = 15`），语义已统一为分层收缩强度。
     pub matchup_smoothing_c: f64,
     /// 导出克制条目的最小**有效样本** `eff_n`（旧字段名，语义已从原始场次改为 `eff_n`）。
+    /// v4 起等价于地图级门槛（模式级见 `mode_matchup_min_eff_samples`）。
     pub matchup_min_samples: u32,
     /// 地图级克制的最小有效样本（与 `matchup_min_samples` 同值）。
     pub map_matchup_min_samples: u32,
@@ -171,7 +187,7 @@ pub struct AnalysisParams {
     pub map_matchup_trust_samples: u32,
     /// 时间衰减半衰期（天），权重 `w = 0.5^(Δt / half_life)`。
     pub decay_half_life_days: f64,
-    /// 有效样本门槛（`eff_n >=` 该值才导出）。
+    /// 有效样本门槛（v3 兼容字段，等价于地图级门槛）。
     pub matchup_min_eff_samples: f64,
     /// 残差显著性门槛（`|delta| >=` 该值才导出，单位与计算口径一致：概率）。
     pub matchup_min_abs_delta: f64,
@@ -183,6 +199,12 @@ pub struct AnalysisParams {
     pub other_mode_weight: f64,
     /// 其他模式折算后的样本上限。
     pub other_mode_cap: f64,
+    /// v4：模式级克制的最小有效样本 `eff_n`。
+    pub mode_matchup_min_eff_samples: f64,
+    /// v4：全局兜底表的最小原始样本量 `n`。
+    pub global_matchup_min_samples: u64,
+    /// v4：全局兜底表的残差门槛，固定 `0.0` 表示**不按 `|delta|` 剪枝**。
+    pub global_matchup_min_abs_delta: f64,
 }
 
 /// 英雄字典项。
@@ -283,6 +305,48 @@ pub struct Matchup {
     /// 其他模式的加权和），所以 `samples` 可能小于门槛而条目仍然存在——
     /// 那说明结论主要来自同模式 / 全库先验，本图只是佐证。
     pub samples: u64,
+    /// 有效对位样本（时间衰减 + BO3 系列降权后）。
+    ///
+    /// 一轮 BO3 的 3 个小局会各乘 `1/3`，因此 3 局同阵容对局在这里合计为 `1.0`。
+    /// `delta` 的分子分母都用这个口径，`eff_n` 门槛也按它判定。
+    pub eff_samples: f64,
+}
+
+/// 全局 1v1 兜底记录（v4 新增，紧凑数组格式）。
+///
+/// JSON 里序列化成 **4 元数组** `[a, b, delta, n]`（不是对象）：
+///
+/// ```text
+/// [1600001, 1600002, -1.25, 37]
+///  id_a      id_b     delta  n
+/// ```
+///
+/// * 无序存储：恒有 `a < b`，每对英雄只有一条记录；`delta` 的方向是「`a` 对 `b`」，
+///   查 `b` 对 `a` 取相反数即可；
+/// * 用数组而非对象是为了控体积：108 名英雄约 4400 条记录，对象格式要多花 ~80KB。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(into = "(i64, i64, f64, u64)", from = "(i64, i64, f64, u64)")]
+pub struct GlobalMatchup {
+    /// 较小的英雄 ID。
+    pub a: i64,
+    /// 较大的英雄 ID（恒有 `a < b`）。
+    pub b: i64,
+    /// `a` 对 `b` 的去偏残差（百分点，2 位小数，`0.0` = 五五开）。
+    pub delta: f64,
+    /// 全库对位有效样本（时间衰减 + BO3 系列降权后，四舍五入取整）。
+    pub n: u64,
+}
+
+impl From<(i64, i64, f64, u64)> for GlobalMatchup {
+    fn from((a, b, delta, n): (i64, i64, f64, u64)) -> Self {
+        Self { a, b, delta, n }
+    }
+}
+
+impl From<GlobalMatchup> for (i64, i64, f64, u64) {
+    fn from(m: GlobalMatchup) -> Self {
+        (m.a, m.b, m.delta, m.n)
+    }
 }
 
 /// 选人顺位建议。
@@ -364,12 +428,31 @@ mod tests {
             opponent: 16_000_001,
             delta: -12.95,
             samples: 37,
+            eff_samples: 12.3333,
         };
         let json = serde_json::to_string(&m).unwrap();
         assert_eq!(
             json,
-            r#"{"opponent":16000001,"delta":-12.95,"samples":37}"#
+            r#"{"opponent":16000001,"delta":-12.95,"samples":37,"eff_samples":12.3333}"#
         );
+    }
+
+    #[test]
+    fn global_matchup_serializes_as_compact_tuple() {
+        // 数组格式：省掉 4 个键名，是控制 JSON 体积的关键
+        let m = GlobalMatchup {
+            a: 16_000_001,
+            b: 16_000_002,
+            delta: -1.25,
+            n: 37,
+        };
+        assert_eq!(
+            serde_json::to_string(&m).unwrap(),
+            "[16000001,16000002,-1.25,37]"
+        );
+        // 反序列化闭环
+        let back: GlobalMatchup = serde_json::from_str("[16000001,16000002,-1.25,37]").unwrap();
+        assert_eq!(back, m);
     }
 
     #[test]

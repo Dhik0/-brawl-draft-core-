@@ -1,13 +1,16 @@
 //! 离线分析引擎：加权胜率、贝叶斯平滑、地图分层去偏的 Log5 克制残差与选人顺位。
 //!
-//! ## 两级聚合
+//! ## 三级聚合
 //!
 //! * **地图维度**（`maps[]`）：出场率、平滑胜率、综合评分、选人顺位，以及
 //!   **地图级克制列表**。地形差异（草图 vs 开阔图）直接体现在这一层，
 //!   是克制结论的首选来源。
 //! * **模式维度**（`modes[]`）：同一模式的地图共享地形族特征，按模式汇总后
-//!   样本量放大数倍，作为单图样本不足时的**先验**；全库（Global）再往上一层，
-//!   作为跨模式的最后兜底。
+//!   样本量放大数倍，作为单图样本不足时的**先验**。
+//! * **全局维度**（`global_matchups`）：全库 10 万+ 场对局汇总的 1v1 去偏残差，
+//!   跨模式兜底。它**不按 `|delta|` 剪枝**，因此能明确回答「这一对是五五开」，
+//!   与「这一对真的没有样本」区分开——前端做 3×3 对位展示时，前两层查不到
+//!   就落到这一层，避免整片空白。
 //!
 //! ## 克制算法：地图分层去偏 + 互斥分层平滑
 //!
@@ -47,7 +50,7 @@
 //! n2_eff = min(0.6 * n2, 40)   e2_eff = e2 * (n2_eff / n2)
 //! n3_eff = min(0.3 * n3, 25)   e3_eff = e3 * (n3_eff / n3)
 //! eff_n  = n1 + n2_eff + n3_eff
-//! delta  = (e1 + e2_eff + e3_eff) / (eff_n + K)        // K = 50 伪场次
+//! delta  = (e1 + e2_eff + e3_eff) / (eff_n + K)        // K = 20 伪场次
 //! ```
 //!
 //! `delta` 是**概率残差**（`0.03` 表示 3 个百分点）。导出时乘以 100 记作
@@ -58,10 +61,18 @@
 //!
 //! ### 过滤与兜底
 //!
-//! 只导出 `eff_n >= 15` 且 `|delta| >= 0.02` 的条目，其余视为噪音（10 场 6 胜
-//! 这类小样本残差约 1.7pp，会被拦掉）。**后端不做任何「正残差过大就抹零」的
-//! 处理**：真实克制关系原样保留，绿灯绝对胜率由前端展示层结合本图基础胜率
-//! 自行兜底。
+//! 三层各有自己的门槛（`K` 统一为 20 伪场次，不再用过强的收缩把中小样本压平）：
+//!
+//! ```text
+//! 地图级  eff_n >= 8   且 |delta| >= 1.5pp
+//! 模式级  eff_n >= 12  且 |delta| >= 1.5pp
+//! 全局级  n     >= 10  不按 |delta| 剪枝（保留均势对位）
+//! ```
+//!
+//! 地图级门槛最低，是因为单图对位天然稀薄；放宽到 `eff_n >= 8` 后，实测 3×3
+//! 对位不再有大面积空白。全局级保留 `delta ≈ 0` 的条目，前端才能区分「五五开」
+//! 和「无数据」。**后端不做任何「正残差过大就抹零」的处理**：真实克制关系原样
+//! 保留，绿灯绝对胜率由前端展示层结合本图基础胜率自行兜底。
 //!
 //! ## 综合评分（`score`）
 //!
@@ -92,7 +103,26 @@
 //!
 //! 胜率榜每个样本按 `w = 0.5^(Δt / 30)` 加权（`Δt` 为距**最新对局**的天数），
 //! 使旧版本平衡性调整的数据自然降权。
-//! **克制层例外**：`delta` 使用原始计数，保证与公式一致、可手算复核。
+//!
+//! ## BO3 系列降权
+//!
+//! 传奇排位是 BO3：同一批 6 名英雄在 10 分钟内会连打 2~3 小局。若把每个小局都当成
+//! 独立样本，有效样本量会虚高 2~3 倍。因此在时间衰减之外再乘一个**系列权重**：
+//!
+//! ```text
+//! 聚簇键   = (map, mode, canonical_teams)   // 两队各自升序，两队整体再按字典序
+//! 时间窗口 = 相邻两局 Δt <= 600s            // 归入同一系列簇（链式合并）
+//! 系列权重 = 1 / k                          // k = 簇内小局数
+//! 最终权重 = 时间衰减 * 系列权重
+//! ```
+//!
+//! `canonical_teams` 让交换红蓝边的小局也能归入同一簇；链式合并意味着 0s / 600s /
+//! 1200s 三局同阵容对局属于同一个系列（每段间隔都没超过 10 分钟）。
+//!
+//! 一轮完整 BO3 因此只贡献 `3 * 1/3 = 1.0` 次独立 BP 权重。**地图展示的总场次
+//! （`total_games`）仍保留原始对局数**，只有胜率、出场率、1v1 对位的有效样本量与
+//! 有效胜场按降权口径计算；`Matchup.samples` 保留原始场次，`Matchup.eff_samples`
+//! 是降权后的有效样本。
 //!
 //! ## 并行策略
 //!
@@ -107,7 +137,8 @@ use rayon::prelude::*;
 
 use crate::db::{parse_battle_time, BattleRow};
 use crate::models::output::{
-    tier_label, AnalysisParams, BrawlerRef, MapBrawlerStat, MapMeta, Matchup, MetaOutput,
+    tier_label, AnalysisParams, BrawlerRef, GlobalMatchup, MapBrawlerStat, MapMeta, Matchup,
+    MetaOutput,
     ModeBrawlerStat, ModeMeta, PickOrder, RolesConfig, TierAudit, TierBucket, SCHEMA_VERSION,
 };
 
@@ -140,9 +171,10 @@ const PICK_MIN_EDGES: usize = 3;
 
 /// 分层贝叶斯收缩的先验强度 K（伪场次）。
 ///
-/// 与旧版 `C = 15` 的差别：`delta` 现在已经是概率残差（未乘 100），
-/// `K = 50` 相当于「本图 50 场伪样本」，比旧口径更保守，能压住 10 场 6 胜这类噪音。
-pub const MATCHUP_PRIOR_K: f64 = 50.0;
+/// 与旧版 `C = 15` 的差别：`delta` 现在已经是概率残差（未乘 100）。
+/// `K = 20` 是「本图 20 场伪样本」的折中：既能压住 5 场 4 胜这类纯噪音，
+/// 又不会把 20~40 场的中小样本真实优势压平（旧值 `K = 50` 会）。
+pub const MATCHUP_PRIOR_K: f64 = 20.0;
 /// 同模式其他地图的样本折算权重。
 pub const SAME_MODE_SAMPLE_WEIGHT: f64 = 0.6;
 /// 同模式其他地图折算后的样本上限（防止外部大样本压过本图）。
@@ -151,13 +183,32 @@ pub const SAME_MODE_SAMPLE_CAP: f64 = 40.0;
 pub const OTHER_MODE_SAMPLE_WEIGHT: f64 = 0.3;
 /// 其他模式折算后的样本上限。
 pub const OTHER_MODE_SAMPLE_CAP: f64 = 25.0;
-/// 导出克制条目的最小有效样本 `eff_n`。
-pub const MIN_MATCHUP_EFF_SAMPLES: f64 = 15.0;
-/// 导出克制条目的最小残差绝对值（概率单位，`0.02` = 2pp）。
-pub const MIN_MATCHUP_ABS_DELTA: f64 = 0.02;
+/// 地图级克制条目的最小有效样本 `eff_n`。
+///
+/// 单图对位天然稀薄，门槛比模式级更低——这是覆盖率的主要来源。
+pub const MAP_MATCHUP_MIN_EFF_SAMPLES: f64 = 8.0;
+/// 模式级克制条目的最小有效样本 `eff_n`。
+///
+/// 模式层样本比单图大数倍，门槛相应抬高，避免整张模式表被噪音灌满。
+pub const MODE_MATCHUP_MIN_EFF_SAMPLES: f64 = 12.0;
+/// 地图级 / 模式级克制条目的最小残差绝对值（概率单位，`0.015` = 1.5pp）。
+pub const MIN_MATCHUP_ABS_DELTA: f64 = 0.015;
+/// 全局兜底表的最小原始对位样本量。
+///
+/// 全局表**不按 `|delta|` 剪枝**：均势对位（`delta ≈ 0`）也要导出，前端才能
+/// 把「五五开」和「无数据」区分开。
+pub const GLOBAL_MATCHUP_MIN_SAMPLES: u64 = 10;
+/// 全局兜底表的残差门槛，固定为 0（不剪枝）。
+pub const GLOBAL_MATCHUP_MIN_ABS_DELTA: f64 = 0.0;
 
 /// 时间衰减的默认半衰期（天）。
 pub const DEFAULT_DECAY_HALF_LIFE_DAYS: f64 = 30.0;
+
+/// BO3 系列聚簇的时间窗口（秒）。
+///
+/// 同一聚簇键内**相邻**两局的时间差不超过该值，就视为同一轮 BO3 的小局。
+/// 600 秒 = 10 分钟，覆盖「同一批 6 人在一局结束后立刻重开」的实际节奏。
+pub const SERIES_CLUSTER_WINDOW_SECS: i64 = 600;
 
 /// 基础胜率的截断区间，防止 Log5 除零与极端值。
 const BASE_RATE_FLOOR: f64 = 0.05;
@@ -197,6 +248,8 @@ pub struct AnalyzeOptions {
     pub matchup_prior_k: f64,
     /// 段位阈值：仅保留 `avg_tier >= min_tier` 的对局（`avg_tier <= 0` 视为未知，保留）。
     pub min_tier: i64,
+    /// 时间衰减半衰期（天）。测试可传 `f64::INFINITY` 关闭衰减。
+    pub decay_half_life_days: f64,
     /// 赛季起始日期字符串（回显）。
     pub season_start: String,
     /// 英雄定位配置。
@@ -216,7 +269,7 @@ pub fn analyze(
         .filter(|b| tier_passes(b.avg_tier, opts.min_tier))
         .collect();
 
-    let weighted = weigh_battles(&kept, DEFAULT_DECAY_HALF_LIFE_DAYS);
+    let weighted = weigh_battles(&kept, opts.decay_half_life_days);
 
     // 1) 按地图分组（一次遍历，权重只算一次）
     let mut by_map: HashMap<&str, Vec<(&BattleRow, f64)>> = HashMap::new();
@@ -292,6 +345,9 @@ pub fn analyze(
             .then_with(|| a.mode.cmp(&b.mode))
     });
 
+    // 6) 全局 1v1 兜底表（第三层）：全库去偏残差，不按 |delta| 剪枝
+    let global_matchups = build_global_matchups(&global_excess, opts.matchup_prior_k);
+
     MetaOutput {
         schema_version: SCHEMA_VERSION,
         updated_at: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -303,20 +359,25 @@ pub fn analyze(
             bayes_prior_weight: opts.bayes_prior_weight,
             // 旧字段名沿用：语义已统一为分层收缩强度 K
             matchup_smoothing_c: opts.matchup_prior_k,
-            matchup_min_samples: MIN_MATCHUP_EFF_SAMPLES as u32,
-            map_matchup_min_samples: MIN_MATCHUP_EFF_SAMPLES as u32,
-            map_matchup_trust_samples: MIN_MATCHUP_EFF_SAMPLES as u32,
-            decay_half_life_days: DEFAULT_DECAY_HALF_LIFE_DAYS,
-            matchup_min_eff_samples: MIN_MATCHUP_EFF_SAMPLES,
+            // 三个旧字段都是「地图级门槛」的历史别名，保留以兼容 v3 消费方
+            matchup_min_samples: MAP_MATCHUP_MIN_EFF_SAMPLES as u32,
+            map_matchup_min_samples: MAP_MATCHUP_MIN_EFF_SAMPLES as u32,
+            map_matchup_trust_samples: MAP_MATCHUP_MIN_EFF_SAMPLES as u32,
+            decay_half_life_days: opts.decay_half_life_days,
+            matchup_min_eff_samples: MAP_MATCHUP_MIN_EFF_SAMPLES,
             matchup_min_abs_delta: MIN_MATCHUP_ABS_DELTA,
             same_mode_weight: SAME_MODE_SAMPLE_WEIGHT,
             same_mode_cap: SAME_MODE_SAMPLE_CAP,
             other_mode_weight: OTHER_MODE_SAMPLE_WEIGHT,
             other_mode_cap: OTHER_MODE_SAMPLE_CAP,
+            mode_matchup_min_eff_samples: MODE_MATCHUP_MIN_EFF_SAMPLES,
+            global_matchup_min_samples: GLOBAL_MATCHUP_MIN_SAMPLES,
+            global_matchup_min_abs_delta: GLOBAL_MATCHUP_MIN_ABS_DELTA,
         },
         brawlers: build_brawler_refs(&kept, brawler_dict),
         maps,
         modes,
+        global_matchups,
         roles: resolve_roles(&opts.roles, brawler_dict),
     }
 }
@@ -376,8 +437,8 @@ pub fn decay_weight(delta_days: f64, half_life_days: f64) -> f64 {
     0.5_f64.powf(delta_days.max(0.0) / half_life_days)
 }
 
-/// 给每条对局计算权重。基准是**数据集中最新的对局**，而不是 `Utc::now()`，
-/// 这样离线重算历史数据时结果可复现。
+/// 给每条对局计算权重 = 时间衰减 × BO3 系列权重。基准是**数据集中最新的对局**，
+/// 而不是 `Utc::now()`，这样离线重算历史数据时结果可复现。
 fn weigh_battles<'a>(
     battles: &[&'a BattleRow],
     half_life_days: f64,
@@ -387,12 +448,14 @@ fn weigh_battles<'a>(
         .map(|b| parse_battle_time(&b.battle_time))
         .collect();
     let latest = times.iter().flatten().copied().max();
+    let series = series_weights(battles);
 
     battles
         .iter()
         .zip(times)
-        .map(|(row, time)| {
-            let weight = match (latest, time) {
+        .zip(series)
+        .map(|((row, time), series_weight)| {
+            let decay = match (latest, time) {
                 (Some(latest), Some(t)) => {
                     let delta_days = (latest - t).num_seconds() as f64 / 86_400.0;
                     decay_weight(delta_days, half_life_days)
@@ -400,9 +463,82 @@ fn weigh_battles<'a>(
                 // 时间缺失时不做衰减，按满权重处理（入库前已校验过时间，属于兜底）
                 _ => 1.0,
             };
-            (*row, weight)
+            (*row, decay * series_weight)
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// BO3 系列聚簇降权
+// ---------------------------------------------------------------------------
+
+/// 系列聚簇键：`(地图, 模式, 规范化阵容)`。
+///
+/// 规范化阵容 = 两队各自的英雄 ID 升序排列，再把两队整体按字典序排列——
+/// 这样小局之间交换红蓝边也归入同一组。
+type SeriesKey<'a> = (&'a str, &'a str, Vec<Vec<i64>>);
+
+/// 把一局的两队英雄规范化成可比较的阵容：队内升序 + 队间字典序。
+fn canonical_lineup(row: &BattleRow) -> Vec<Vec<i64>> {
+    let mut teams = vec![row.winners.clone(), row.losers.clone()];
+    for team in &mut teams {
+        team.sort_unstable();
+    }
+    teams.sort();
+    teams
+}
+
+/// 计算每局对局的**系列权重** `1/k`（`k` = 该局所属 BO3 系列簇内的小局数）。
+///
+/// 聚簇规则见模块文档「BO3 系列降权」：同 `(map, mode, canonical_teams)` 的对局按
+/// 时间升序，相邻两局时间差 `<= 600s` 就并入同一簇（链式）。时间不可解析的对局
+/// 无法判定先后，单独按 `1.0` 处理，绝不把不确定的数据合并降权。
+///
+/// 返回值的长度与 `battles` 一一对应；`sum(返回值)` 即「聚簇后的有效 BP 组数」。
+pub fn series_weights<'a>(battles: &[&'a BattleRow]) -> Vec<f64> {
+    let mut weights = vec![1.0_f64; battles.len()];
+    let mut groups: HashMap<SeriesKey<'a>, Vec<(i64, usize)>> = HashMap::new();
+
+    for (idx, row) in battles.iter().enumerate() {
+        let Some(ts) = parse_battle_time(&row.battle_time) else {
+            continue; // 时间不可解析：保持独立权重 1.0
+        };
+        groups
+            .entry((row.map_name.as_str(), row.mode.as_str(), canonical_lineup(row)))
+            .or_default()
+            .push((ts.timestamp(), idx));
+    }
+
+    for mut entries in groups.into_values() {
+        // 时间升序；同一秒内按原始索引排序，保证同一份数据每次聚簇结果一致
+        entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let mut start = 0usize;
+        for i in 1..=entries.len() {
+            let split = i == entries.len()
+                || entries[i].0 - entries[i - 1].0 > SERIES_CLUSTER_WINDOW_SECS;
+            if split {
+                let k = (i - start) as f64;
+                for &(_, idx) in &entries[start..i] {
+                    weights[idx] = 1.0 / k;
+                }
+                start = i;
+            }
+        }
+    }
+
+    weights
+}
+
+/// 供 CLI 报告的聚簇摘要：`(原始对局数, 聚簇后有效 BP 组数)`。
+///
+/// 只统计通过段位门槛的对局，与 `analyze` 的口径保持一致。
+pub fn series_cluster_report(battles: &[BattleRow], min_tier: i64) -> (u64, u64) {
+    let kept: Vec<&BattleRow> = battles
+        .iter()
+        .filter(|b| tier_passes(b.avg_tier, min_tier))
+        .collect();
+    let groups: f64 = series_weights(&kept).iter().sum();
+    (kept.len() as u64, groups.round() as u64)
 }
 
 // ---------------------------------------------------------------------------
@@ -437,28 +573,33 @@ impl Accum {
     }
 }
 
-/// 两两对位的原始计数。
+/// 两两对位的计数。
+///
+/// `n` / `w` 是**有效计数**（已乘时间衰减与 BO3 系列权重），克制残差必须用它们，
+/// 否则一轮 BO3 会被当成 3 次独立交锋；`raw_n` 保留原始交锋场次供展示。
 #[derive(Debug, Default, Clone, Copy)]
 struct PairStat {
-    /// 真实交锋场次。
-    n: u64,
-    /// 前者对后者的胜场。
-    w: u64,
+    /// 有效交锋样本（加权）。
+    n: f64,
+    /// 前者对后者的有效胜场（加权）。
+    w: f64,
+    /// 原始交锋场次（未加权，展示用）。
+    raw_n: u64,
 }
 
 impl PairStat {
-    fn add_win(&mut self) {
-        self.n += 1;
-        self.w += 1;
-    }
-
-    fn add_loss(&mut self) {
-        self.n += 1;
+    fn add(&mut self, weight: f64, won: bool) {
+        self.n += weight;
+        self.raw_n += 1;
+        if won {
+            self.w += weight;
+        }
     }
 
     fn merge(&mut self, other: &PairStat) {
         self.n += other.n;
         self.w += other.w;
+        self.raw_n += other.raw_n;
     }
 }
 
@@ -535,7 +676,8 @@ fn discount_samples(n: f64, e: f64, weight: f64, cap: f64) -> (f64, f64) {
 ///
 /// * `n1` / `e1`：本图场次与超额胜场；
 /// * `n2` / `e2`：同模式其他地图（**已扣除本图**，不重复计数）；
-/// * `n3` / `e3`：其他模式（**已扣除本模式**，不重复计数）。
+/// * `n3` / `e3`：其他模式（**已扣除本模式**，不重复计数）；
+/// * `k`：先验强度（伪场次），由 [`AnalyzeOptions::matchup_prior_k`] 传入。
 ///
 /// 返回 `(delta, eff_n)`：`delta` 是概率残差（未乘 100），`eff_n` 是折算后的
 /// 有效样本量，用于导出过滤。
@@ -546,17 +688,20 @@ pub fn hierarchical_delta(
     e2: f64,
     n3: f64,
     e3: f64,
+    k: f64,
 ) -> (f64, f64) {
     let (n2_eff, e2_eff) = discount_samples(n2, e2, SAME_MODE_SAMPLE_WEIGHT, SAME_MODE_SAMPLE_CAP);
     let (n3_eff, e3_eff) = discount_samples(n3, e3, OTHER_MODE_SAMPLE_WEIGHT, OTHER_MODE_SAMPLE_CAP);
     let eff_n = n1 + n2_eff + n3_eff;
-    let delta = (e1 + e2_eff + e3_eff) / (eff_n + MATCHUP_PRIOR_K);
+    let delta = (e1 + e2_eff + e3_eff) / (eff_n + k.max(0.0));
     (delta, eff_n)
 }
 
-/// 导出门槛：有效样本够、且残差足够显著。
-fn passes_export_filter(delta: f64, eff_n: f64) -> bool {
-    eff_n >= MIN_MATCHUP_EFF_SAMPLES && delta.abs() >= MIN_MATCHUP_ABS_DELTA
+/// 导出门槛：有效样本达到该层门槛、且残差足够显著。
+///
+/// 地图级与模式级的 `min_eff` 不同（见模块文档），显著性门槛共用。
+fn passes_export_filter(delta: f64, eff_n: f64, min_eff: f64) -> bool {
+    eff_n >= min_eff && delta.abs() >= MIN_MATCHUP_ABS_DELTA
 }
 
 // ---------------------------------------------------------------------------
@@ -583,8 +728,8 @@ fn build_map_core(map_name: &str, rows: &[(&BattleRow, f64)], opts: &AnalyzeOpti
                 if a == b {
                     continue; // 镜像对局不计入克制关系
                 }
-                pairs.entry((*a, *b)).or_default().add_win();
-                pairs.entry((*b, *a)).or_default().add_loss();
+                pairs.entry((*a, *b)).or_default().add(*weight, true);
+                pairs.entry((*b, *a)).or_default().add(*weight, false);
             }
         }
     }
@@ -596,14 +741,13 @@ fn build_map_core(map_name: &str, rows: &[(&BattleRow, f64)], opts: &AnalyzeOpti
         .unwrap_or_else(|| "unknown".to_string());
 
     // 该图的基础胜率 P(a, m)：平滑后钳制到 [0.05, 0.95]，供本图 Log5 使用。
+    //
+    // 用**加权**的 wins/games 而不是原始计数：`e = w - n * E` 里的 `w` / `n` 已经是
+    // 加权值，基础胜率必须同口径，否则一轮 BO3 会同时抬高 `p` 和 `e`。
     let base: HashMap<i64, f64> = acc
         .iter()
         .map(|(id, a)| {
-            let p = smoothed_rate(
-                a.raw_wins as f64,
-                a.raw_games as f64,
-                opts.bayes_prior_weight,
-            );
+            let p = smoothed_rate(a.wins, a.games, opts.bayes_prior_weight);
             (*id, clamp_base(p))
         })
         .collect();
@@ -618,12 +762,12 @@ fn build_map_core(map_name: &str, rows: &[(&BattleRow, f64)], opts: &AnalyzeOpti
             base.get(a).copied().unwrap_or(0.5),
             base.get(b).copied().unwrap_or(0.5),
         );
-        let n = p.n as f64;
+        let n = p.n;
         excess.insert(
             (*a, *b),
             Stratum {
                 n,
-                e: p.w as f64 - n * e_ab,
+                e: p.w - n * e_ab,
             },
         );
     }
@@ -679,6 +823,7 @@ fn map_deltas(
     mode_idx: usize,
     mode_excess: &HashMap<ModePairKey, Stratum>,
     global_excess: &HashMap<PairKey, Stratum>,
+    k: f64,
 ) -> HashMap<PairKey, f64> {
     let mut out: HashMap<PairKey, f64> = HashMap::with_capacity(core.excess.len() * 2);
 
@@ -694,8 +839,9 @@ fn map_deltas(
             m.e - s1.e,
             (g.n - m.n).max(0.0),
             g.e - m.e,
+            k,
         );
-        if !passes_export_filter(delta, eff_n) {
+        if !passes_export_filter(delta, eff_n, MAP_MATCHUP_MIN_EFF_SAMPLES) {
             continue;
         }
         let pp = round2(delta * 100.0);
@@ -712,6 +858,7 @@ fn mode_deltas(
     mode_idx: usize,
     mode_excess: &HashMap<ModePairKey, Stratum>,
     global_excess: &HashMap<PairKey, Stratum>,
+    k: f64,
 ) -> HashMap<PairKey, f64> {
     let mut out: HashMap<PairKey, f64> = HashMap::new();
 
@@ -727,8 +874,9 @@ fn mode_deltas(
             0.0,
             (g.n - s.n).max(0.0),
             g.e - s.e,
+            k,
         );
-        if !passes_export_filter(delta, eff_n) {
+        if !passes_export_filter(delta, eff_n, MODE_MATCHUP_MIN_EFF_SAMPLES) {
             continue;
         }
         let pp = round2(delta * 100.0);
@@ -736,6 +884,40 @@ fn mode_deltas(
         out.insert((*hi, *lo), -pp);
     }
 
+    out
+}
+
+/// 全局 1v1 兜底表（第三层）：全库去偏残差，**不按 `|delta|` 剪枝**。
+///
+/// * 只用规范方向 `lo < hi`，每对英雄一条记录；
+/// * 门槛只有样本 `n >= GLOBAL_MATCHUP_MIN_SAMPLES`（`n` 是 BO3 降权后的有效样本），
+///   `delta ≈ 0` 的均势对位也会保留——这正是前端区分「五五开」与「无数据」的依据；
+/// * 收缩口径与地图/模式层一致：`delta = Σe / (n + K)`，保证三层同尺度；
+/// * 输出按 `(lo, hi)` 排序，保证导出文件稳定可 diff。
+fn build_global_matchups(
+    global_excess: &HashMap<PairKey, Stratum>,
+    k: f64,
+) -> Vec<GlobalMatchup> {
+    let mut out: Vec<GlobalMatchup> = global_excess
+        .iter()
+        .filter_map(|((lo, hi), s)| {
+            let n = s.n.round() as u64;
+            if n < GLOBAL_MATCHUP_MIN_SAMPLES {
+                return None;
+            }
+            let delta_pp = round2(s.e / (s.n + k.max(0.0)) * 100.0);
+            if delta_pp.abs() < GLOBAL_MATCHUP_MIN_ABS_DELTA {
+                return None;
+            }
+            Some(GlobalMatchup {
+                a: *lo,
+                b: *hi,
+                delta: delta_pp,
+                n,
+            })
+        })
+        .collect();
+    out.sort_by_key(|m| (m.a, m.b));
     out
 }
 
@@ -775,6 +957,9 @@ fn extract_profiles(
 }
 
 /// 按英雄枚举已导出的克制条目（只保留 `delta` 里存在的边）。
+///
+/// `samples` 是原始交锋场次，`eff_samples` 是应用 BO3 系列降权后的有效样本——
+/// 一轮 3 局的 BO3 在这里只算 1 场。
 fn matchups_of(
     id: i64,
     pairs: &HashMap<PairKey, PairStat>,
@@ -787,7 +972,8 @@ fn matchups_of(
             delta.get(&(id, *to)).map(|d| Matchup {
                 opponent: *to,
                 delta: *d,
-                samples: p.n,
+                samples: p.raw_n,
+                eff_samples: round4(p.n),
             })
         })
         .collect()
@@ -823,7 +1009,7 @@ fn build_mode(
         }
     }
 
-    let delta = mode_deltas(mode_idx, mode_excess, global_excess);
+    let delta = mode_deltas(mode_idx, mode_excess, global_excess, opts.matchup_prior_k);
 
     let mut brawlers: Vec<ModeBrawlerStat> = acc
         .iter()
@@ -892,7 +1078,7 @@ fn build_map(
     opts: &AnalyzeOptions,
 ) -> MapMeta {
     // 本图 delta：本图残差为主，同模式 / 其他模式按互斥权重做先验
-    let delta = map_deltas(core, mode_idx, mode_excess, global_excess);
+    let delta = map_deltas(core, mode_idx, mode_excess, global_excess, opts.matchup_prior_k);
 
     // 本图对位画像：顺位判定只看这张图上已导出的克制关系
     let map_profiles = extract_profiles(&core.pairs, &delta);
@@ -1264,12 +1450,26 @@ mod tests {
             bayes_prior_weight: 50.0,
             matchup_prior_k: MATCHUP_PRIOR_K,
             min_tier: 20,
+            // 单元测试默认关闭时间衰减，断言才能按「每场权重 1.0」手算复核。
+            // 衰减本身由 `win_rate_is_time_decay_weighted` 单独覆盖。
+            decay_half_life_days: f64::INFINITY,
             season_start: "2026-07-20".into(),
             roles: RolesConfig {
                 version: 1,
                 roles: vec![],
             },
         }
+    }
+
+    /// 测试基准时间。
+    const TEST_BASE_TIME: &str = "20261020T000000.000Z";
+    /// 测试用的相邻对局步长：> 600 秒，保证不会被 BO3 聚簇误合并。
+    const TEST_STEP_SECS: i64 = 601;
+
+    /// 以 `TEST_BASE_TIME` 为基准偏移若干秒，生成 `battleTime` 字符串。
+    fn shift_time(offset_secs: i64) -> String {
+        let base = parse_battle_time(TEST_BASE_TIME).expect("基准时间必须可解析");
+        crate::db::format_battle_time(&(base + chrono::Duration::seconds(offset_secs)))
     }
 
     fn dict(ids: &[i64]) -> HashMap<i64, String> {
@@ -1327,6 +1527,9 @@ mod tests {
     }
 
     /// 构造 n 场 `winners` 击败 `losers` 的对局。
+    ///
+    /// 时间按 `TEST_STEP_SECS` 递增：这 n 场阵容完全相同，若时间戳相同会被 BO3
+    /// 聚簇合并成一个系列（每场权重 1/n），那样断言就不再是「n 场独立样本」。
     fn battles_with(
         map: &str,
         mode: &str,
@@ -1336,7 +1539,13 @@ mod tests {
     ) -> Vec<BattleRow> {
         (0..n)
             .map(|i| {
-                let mut r = row(map, mode, winners, losers);
+                let mut r = row_at(
+                    map,
+                    mode,
+                    &shift_time(i as i64 * TEST_STEP_SECS),
+                    winners,
+                    losers,
+                );
                 r.battle_hash = format!("{map}-{i}");
                 r
             })
@@ -1352,18 +1561,22 @@ mod tests {
     /// p_B   = 25 / (n + 50)              // B 全败
     /// E_AB  = 1 - p_B
     /// e     = n * (1 - E_AB) = 25n / (n + 50)
-    /// delta = e / (n + 50) = 25n / (n + 50)^2
+    /// delta = e / (n + K) = 25n / ((n + 50)(n + 20))      // K = 20
     /// ```
     ///
-    /// n = 25 -> 11.11pp，n = 50 -> 12.5pp，n = 100 -> 11.11pp。
+    /// n = 10 -> 13.89pp，n = 25 -> 18.52pp，n = 50 -> 17.86pp。
     fn counter_ladder(map: &str, mode: &str, n: usize, tag: &str) -> Vec<BattleRow> {
         let mut out = Vec::with_capacity(n * 2);
         for i in 0..n {
-            let mut win = row(map, mode, [1, 10, 11], [2, 12, 13]);
+            // 同一层的 n 场阵容相同，时间必须错开，避免被 BO3 聚簇合并
+            let t = shift_time(i as i64 * TEST_STEP_SECS);
+
+            let mut win = row_at(map, mode, &t, [1, 10, 11], [2, 12, 13]);
             win.battle_hash = format!("{tag}-w{i}");
             out.push(win);
 
-            let mut lose = row(map, mode, [3, 12, 13], [1, 10, 11]);
+            // 输的那局是另一套阵容（3 号击败 1 号），与上面不构成同一系列
+            let mut lose = row_at(map, mode, &t, [3, 12, 13], [1, 10, 11]);
             lose.battle_hash = format!("{tag}-l{i}");
             out.push(lose);
         }
@@ -1408,49 +1621,77 @@ mod tests {
     #[test]
     fn hierarchical_delta_is_antisymmetric() {
         // 交换 A/B 时：n1/n2/n3 不变，e1/e2/e3 全部取反 -> delta 精确取反
-        let (ab, eff_ab) = hierarchical_delta(40.0, 6.0, 100.0, 12.0, 200.0, -8.0);
-        let (ba, eff_ba) = hierarchical_delta(40.0, -6.0, 100.0, -12.0, 200.0, 8.0);
+        let (ab, eff_ab) = hierarchical_delta(40.0, 6.0, 100.0, 12.0, 200.0, -8.0, MATCHUP_PRIOR_K);
+        let (ba, eff_ba) =
+            hierarchical_delta(40.0, -6.0, 100.0, -12.0, 200.0, 8.0, MATCHUP_PRIOR_K);
         assert!((ab + ba).abs() < 1e-12, "delta_BA 必须是 -delta_AB");
         assert!((eff_ab - eff_ba).abs() < 1e-12);
     }
 
     #[test]
-    fn ten_games_six_wins_is_below_noise_threshold() {
-        // 10 场 6 胜、E = 0.5 -> e = 1；delta = 1 / (10 + 50) ≈ 0.0167 < 0.02
-        let (delta, eff_n) = hierarchical_delta(10.0, 1.0, 0.0, 0.0, 0.0, 0.0);
+    fn prior_strength_is_twenty_pseudo_games() {
+        // K 从 50 下调到 20：同样 10 场 6 胜（e = 1），残差从 1/60 放大到 1/30
+        assert_eq!(MATCHUP_PRIOR_K, 20.0);
+        let (delta, eff_n) = hierarchical_delta(10.0, 1.0, 0.0, 0.0, 0.0, 0.0, MATCHUP_PRIOR_K);
+        assert!((delta - 1.0 / 30.0).abs() < 1e-12, "实际 {delta}");
         assert!(
-            delta < MIN_MATCHUP_ABS_DELTA,
-            "10 场 6 胜的残差必须低于噪音门槛，实际 {delta}"
+            delta >= MIN_MATCHUP_ABS_DELTA,
+            "10 场 6 胜的 3.3pp 残差在 1.5pp 门槛下应被导出，实际 {delta}"
         );
-        assert!((delta - 1.0 / 60.0).abs() < 1e-12);
-        assert!(!passes_export_filter(delta, eff_n), "样本不足时不得导出");
+        assert!(
+            passes_export_filter(delta, eff_n, MAP_MATCHUP_MIN_EFF_SAMPLES),
+            "eff_n = 10 >= 8，应通过地图级门槛"
+        );
+    }
+
+    #[test]
+    fn thin_map_sample_is_blocked_by_sample_threshold() {
+        // 4 场 3 胜：残差 1/24 ≈ 4.2pp 够显著，但 eff_n = 4 < 8 必须被样本门槛拦住
+        let (delta, eff_n) = hierarchical_delta(4.0, 1.0, 0.0, 0.0, 0.0, 0.0, MATCHUP_PRIOR_K);
+        assert!(delta.abs() >= MIN_MATCHUP_ABS_DELTA);
+        assert!(
+            !passes_export_filter(delta, eff_n, MAP_MATCHUP_MIN_EFF_SAMPLES),
+            "地图级门槛为 eff_n >= 8，4 场不得导出"
+        );
+        // 同一份数据在模式级（eff_n >= 12）同样不够
+        assert!(!passes_export_filter(delta, eff_n, MODE_MATCHUP_MIN_EFF_SAMPLES));
+    }
+
+    #[test]
+    fn mode_threshold_is_stricter_than_map_threshold() {
+        // eff_n = 10：地图级放行，模式级拦下——两层的稀疏程度不同
+        let (delta, eff_n) = hierarchical_delta(10.0, 1.0, 0.0, 0.0, 0.0, 0.0, MATCHUP_PRIOR_K);
+        assert_eq!(eff_n, 10.0);
+        assert!(passes_export_filter(delta, eff_n, MAP_MATCHUP_MIN_EFF_SAMPLES));
+        assert!(!passes_export_filter(delta, eff_n, MODE_MATCHUP_MIN_EFF_SAMPLES));
     }
 
     #[test]
     fn external_samples_are_discounted_and_capped() {
         // 同模式 10000 场 -> 折算 0.6 后封顶 40；其他模式 10000 场 -> 封顶 25
-        let (delta, eff_n) = hierarchical_delta(0.0, 0.0, 10_000.0, 1_000.0, 10_000.0, 1_000.0);
+        let (delta, eff_n) =
+            hierarchical_delta(0.0, 0.0, 10_000.0, 1_000.0, 10_000.0, 1_000.0, MATCHUP_PRIOR_K);
         assert!((eff_n - 65.0).abs() < 1e-9, "eff_n 应为 40 + 25，实际 {eff_n}");
         // e 同步按比例缩放：40/10000 * 1000 + 25/10000 * 1000 = 4 + 2.5
-        assert!((delta - 6.5 / 115.0).abs() < 1e-12, "实际 {delta}");
+        assert!((delta - 6.5 / 85.0).abs() < 1e-12, "实际 {delta}");
     }
 
     #[test]
     fn large_local_sample_overrides_external_prior() {
         // 本图 200 场、+20 超额胜场（10% 残差）；同模式其他图 300 场却强烈反向
-        let (delta, eff_n) = hierarchical_delta(200.0, 20.0, 300.0, -30.0, 0.0, 0.0);
+        let (delta, eff_n) = hierarchical_delta(200.0, 20.0, 300.0, -30.0, 0.0, 0.0, MATCHUP_PRIOR_K);
         assert!(eff_n > 200.0);
         assert!(
             delta > 0.05,
             "本图大样本必须能反转外部先验，实际 {delta}"
         );
-        assert!(passes_export_filter(delta, eff_n));
+        assert!(passes_export_filter(delta, eff_n, MAP_MATCHUP_MIN_EFF_SAMPLES));
     }
 
     #[test]
     fn thin_local_sample_defers_to_external_prior() {
         // 本图只有 10 场且略负，外部 300 场强正 -> 结果由先验主导
-        let (delta, _) = hierarchical_delta(10.0, -1.0, 300.0, 30.0, 0.0, 0.0);
+        let (delta, _) = hierarchical_delta(10.0, -1.0, 300.0, 30.0, 0.0, 0.0, MATCHUP_PRIOR_K);
         assert!(
             delta > MIN_MATCHUP_ABS_DELTA,
             "薄样本应被外部先验拉正，实际 {delta}"
@@ -1459,10 +1700,44 @@ mod tests {
 
     #[test]
     fn zero_external_samples_do_not_create_nan() {
-        let (delta, eff_n) = hierarchical_delta(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let (delta, eff_n) = hierarchical_delta(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, MATCHUP_PRIOR_K);
         assert!(delta.is_finite() && delta == 0.0);
         assert_eq!(eff_n, 0.0);
-        assert!(!passes_export_filter(delta, eff_n));
+        assert!(!passes_export_filter(delta, eff_n, MAP_MATCHUP_MIN_EFF_SAMPLES));
+    }
+
+    // -----------------------------------------------------------------------
+    // 全局兜底表
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn global_matchups_keep_even_pairs_and_drop_thin_samples() {
+        let mut excess: HashMap<PairKey, Stratum> = HashMap::new();
+        // 均势对位：n 够、残差极小 -> 必须保留（前端据此判「五五开」）
+        excess.insert((1, 2), Stratum { n: 400.0, e: 0.5 });
+        // 薄样本：n < 10 -> 丢弃
+        excess.insert((1, 3), Stratum { n: 9.0, e: 5.0 });
+        // 强克制：n 够 -> 保留，delta = e / (n + K)
+        excess.insert((2, 3), Stratum { n: 100.0, e: 20.0 });
+
+        let out = build_global_matchups(&excess, MATCHUP_PRIOR_K);
+        assert_eq!(out.len(), 2, "n < 10 的条目必须被丢弃，均势对位必须保留");
+
+        // 按 (a, b) 升序，且恒有 a < b
+        assert!(out.windows(2).all(|w| (w[0].a, w[0].b) < (w[1].a, w[1].b)));
+        assert!(out.iter().all(|m| m.a < m.b));
+
+        let even = out.iter().find(|m| (m.a, m.b) == (1, 2)).unwrap();
+        assert_eq!(even.n, 400);
+        assert!(
+            even.delta.abs() < 0.5,
+            "均势对位的残差应接近 0 但仍被导出（区别于无数据），实际 {}",
+            even.delta
+        );
+
+        let strong = out.iter().find(|m| (m.a, m.b) == (2, 3)).unwrap();
+        assert!((strong.delta - round2(20.0 / 120.0 * 100.0)).abs() < 1e-9);
+        assert_eq!(strong.n, 100);
     }
 
     // -----------------------------------------------------------------------
@@ -1504,7 +1779,9 @@ mod tests {
         ];
 
         let ids = vec![1, 2, 10, 11, 12, 13];
-        let out = analyze(&battles, &dict(&ids), &opts());
+        let mut o = opts();
+        o.decay_half_life_days = DEFAULT_DECAY_HALF_LIFE_DAYS;
+        let out = analyze(&battles, &dict(&ids), &o);
         let a = out.maps[0].brawlers.iter().find(|b| b.id == 1).unwrap();
 
         // 原始计数不受影响
@@ -1519,13 +1796,26 @@ mod tests {
 
     #[test]
     fn uniform_weights_reproduce_plain_win_rate() {
-        // 所有对局时间相同 -> 权重全为 1.0，结果应与朴素胜率一致
+        // 每场对局都是独立样本（时间错开、衰减关闭）-> 权重全为 1.0，
+        // 结果应与朴素胜率一致
         let mut battles = Vec::new();
         for i in 0..10 {
             let mut r = if i < 6 {
-                row("M", "brawlBall", [1, 10, 11], [2, 12, 13])
+                row_at(
+                    "M",
+                    "brawlBall",
+                    &shift_time(i as i64 * TEST_STEP_SECS),
+                    [1, 10, 11],
+                    [2, 12, 13],
+                )
             } else {
-                row("M", "brawlBall", [2, 12, 13], [1, 10, 11])
+                row_at(
+                    "M",
+                    "brawlBall",
+                    &shift_time(i as i64 * TEST_STEP_SECS),
+                    [2, 12, 13],
+                    [1, 10, 11],
+                )
             };
             r.battle_hash = format!("h{i}");
             battles.push(r);
@@ -1585,7 +1875,8 @@ mod tests {
     #[test]
     fn mode_matchups_sum_excess_wins_across_maps() {
         // 两张同模式地图各 25 场阶梯（每层 25 胜 + 25 负 = 50 局）：
-        // 对位样本 N_mode = 50，超额胜场 = 2 * 8.333，delta = 16.67 / 100 ≈ 16.67pp
+        // 对位样本 N_mode = 50，超额胜场 = 2 * 8.333，
+        // delta = 16.67 / (50 + 20) ≈ 23.81pp（K 从 50 降到 20 后同步放大）
         let mut battles = counter_ladder("M1", "brawlBall", 25, "m1");
         battles.extend(counter_ladder("M2", "brawlBall", 25, "m2"));
 
@@ -1602,8 +1893,8 @@ mod tests {
             .clone();
         assert_eq!(a_vs_b.samples, 50);
         assert!(
-            (a_vs_b.delta - 16.67).abs() < 0.05,
-            "模式层 delta 应为 16.67pp，实际 {}",
+            (a_vs_b.delta - 23.81).abs() < 0.05,
+            "模式层 delta 应为 23.81pp，实际 {}",
             a_vs_b.delta
         );
     }
@@ -1637,7 +1928,13 @@ mod tests {
         // 2/3 号是弱势英雄，对彼此 50%。Log5 残差应让 1 号的克制关系接近 0。
         let mut battles = Vec::new();
         let mut push = |i: usize, winners: [i64; 3], losers: [i64; 3], tag: &str| {
-            let mut r = row("M", "brawlBall", winners, losers);
+            let mut r = row_at(
+                "M",
+                "brawlBall",
+                &shift_time(i as i64 * TEST_STEP_SECS),
+                winners,
+                losers,
+            );
             r.battle_hash = format!("{tag}-{i}");
             battles.push(r);
         };
@@ -1672,7 +1969,7 @@ mod tests {
 
     #[test]
     fn matchup_below_eff_threshold_is_dropped() {
-        // 5 场 < eff_n 门槛 15
+        // 5 场 < 地图级 eff_n 门槛 8
         let battles = battles_with("M", "brawlBall", [1, 10, 11], [2, 12, 13], 5);
         let ids = vec![1, 2, 10, 11, 12, 13];
         let out = analyze(&battles, &dict(&ids), &opts());
@@ -1686,22 +1983,33 @@ mod tests {
 
     #[test]
     fn map_matchup_needs_enough_eff_samples() {
-        // 10 场：eff_n = 10 < 15，即使残差 6.9pp 也不导出
-        let thin = counter_ladder("M", "brawlBall", 10, "t");
+        // 5 场：eff_n = 5 < 8，即使残差 9.1pp 也不导出
+        let thin = counter_ladder("M", "brawlBall", 5, "t");
         let out = analyze(&thin, &dict(&ALL), &opts());
         assert!(
             matchup_on_map(find_map(&out, "M"), 1, 2).is_none(),
             "eff_n 不足的条目必须被剔除"
         );
 
-        // 25 场：eff_n = 25，delta = 11.11pp，正常导出
+        // 10 场：eff_n = 10 >= 8，残差 13.89pp，放行（旧口径 eff_n >= 15 会漏掉）
+        let mid = counter_ladder("M", "brawlBall", 10, "m");
+        let out = analyze(&mid, &dict(&ALL), &opts());
+        let entry = matchup_on_map(find_map(&out, "M"), 1, 2).expect("10 场应导出");
+        assert_eq!(entry.samples, 10);
+        assert!(
+            (entry.delta - 13.89).abs() < 0.05,
+            "手算 delta 应为 13.89pp，实际 {}",
+            entry.delta
+        );
+
+        // 25 场：eff_n = 25，delta = 18.52pp
         let solid = counter_ladder("M", "brawlBall", 25, "s");
         let out = analyze(&solid, &dict(&ALL), &opts());
         let entry = matchup_on_map(find_map(&out, "M"), 1, 2).expect("25 场应导出");
         assert_eq!(entry.samples, 25);
         assert!(
-            (entry.delta - 11.11).abs() < 0.05,
-            "手算 delta 应为 11.11pp，实际 {}",
+            (entry.delta - 18.52).abs() < 0.05,
+            "手算 delta 应为 18.52pp，实际 {}",
             entry.delta
         );
     }
@@ -1729,9 +2037,10 @@ mod tests {
         let d1 = matchup_on_map(find_map(&out, "M1"), 1, 2).expect("M1 应导出");
         let d2 = matchup_on_map(find_map(&out, "M2"), 1, 2).expect("M2 应借先验导出");
 
-        // 纯本图口径（无外部样本）时 M2 只有 3 场，残差约 2.7pp
+        // 纯本图口径（无外部样本）时 M2 只有 3 场，残差约 6.2pp；
+        // 借同模式先验后应更高，但仍低于本图样本充足的 M1
         assert!(
-            d2.delta > 2.7,
+            d2.delta > 6.2,
             "薄样本应被同模式先验抬高，实际 {}",
             d2.delta
         );
@@ -1744,39 +2053,43 @@ mod tests {
     }
 
     #[test]
-    fn ten_games_six_wins_is_filtered_out_end_to_end() {
-        // 10 场 6 胜 4 负，双方只打过对方 -> 基础胜率都接近 50%，
-        // 残差约 1.1pp，必须被「eff_n >= 15 且 |delta| >= 0.02」拦掉。
+    fn ten_games_six_wins_clears_relaxed_threshold_end_to_end() {
+        // 10 场 6 胜 4 负，双方只打过对方。平滑后的基础胜率是 0.5167 / 0.4833，
+        // E_AB = 0.5333，e = 0.667，delta = 0.667 / 30 ≈ 2.22pp。
+        // K 降到 20、门槛降到 1.5pp 后，这类中小样本**应当**导出——正是它让
+        // 3×3 对位不再空白；旧口径（K=50 + eff_n>=15）会把它整条漏掉。
         let mut battles = Vec::new();
         for i in 0..10 {
+            let t = shift_time(i as i64 * TEST_STEP_SECS);
             let mut r = if i < 6 {
-                row("M", "bounty", [1, 10, 11], [2, 12, 13])
+                row_at("M", "bounty", &t, [1, 10, 11], [2, 12, 13])
             } else {
-                row("M", "bounty", [2, 12, 13], [1, 10, 11])
+                row_at("M", "bounty", &t, [2, 12, 13], [1, 10, 11])
             };
             r.battle_hash = format!("n{i}");
             battles.push(r);
         }
         let out = analyze(&battles, &dict(&ALL), &opts());
-        let map = find_map(&out, "M");
-        let entry = matchup_on_map(map, 1, 2);
-        if let Some(m) = entry {
-            assert!(
-                m.delta.abs() < 2.0,
-                "10 场 6 胜的残差必须低于 2pp，实际 {}",
-                m.delta
-            );
-        }
+        let entry = matchup_on_map(find_map(&out, "M"), 1, 2).expect("10 场 6 胜应导出");
+        assert_eq!(entry.samples, 10);
+        assert!(
+            (entry.delta - 2.22).abs() < 0.05,
+            "残差应为 2.22pp，实际 {}",
+            entry.delta
+        );
+        // 反向条目必须严格取反
+        let rev = matchup_on_map(find_map(&out, "M"), 2, 1).expect("反向条目同样导出");
+        assert_eq!(rev.delta, -entry.delta);
     }
 
     #[test]
     fn strong_positive_residual_is_not_clamped() {
-        // 后端严禁对正残差做抹零 / 截断：50 场阶梯的理论值 12.5pp 必须原样导出
+        // 后端严禁对正残差做抹零 / 截断：50 场阶梯的理论值 17.86pp 必须原样导出
         let battles = counter_ladder("M", "knockout", 50, "k");
         let out = analyze(&battles, &dict(&ALL), &opts());
         let entry = matchup_on_map(find_map(&out, "M"), 1, 2).expect("应导出");
         assert!(
-            (entry.delta - 12.5).abs() < 0.05,
+            (entry.delta - 17.86).abs() < 0.05,
             "正残差必须原样保留，实际 {}",
             entry.delta
         );
@@ -1999,12 +2312,24 @@ mod tests {
         // 地图级判定下，M1 的克制不该污染 M2。
         let mut battles = Vec::new();
         for i in 0..40 {
-            let mut r = row("M1", "brawlBall", [2, 12, 13], [1, 10, 11]);
+            let mut r = row_at(
+                "M1",
+                "brawlBall",
+                &shift_time(i as i64 * TEST_STEP_SECS),
+                [2, 12, 13],
+                [1, 10, 11],
+            );
             r.battle_hash = format!("m1-{i}");
             battles.push(r);
         }
         for i in 0..40 {
-            let mut r = row("M2", "brawlBall", [1, 5, 6], [4, 14, 15]);
+            let mut r = row_at(
+                "M2",
+                "brawlBall",
+                &shift_time(i as i64 * TEST_STEP_SECS),
+                [1, 5, 6],
+                [4, 14, 15],
+            );
             r.battle_hash = format!("m2-{i}");
             battles.push(r);
         }
@@ -2036,12 +2361,14 @@ mod tests {
         // 且有 3 条以上显著对位边，应判 LAST（后手康特位）。
         let mut battles = Vec::new();
         for i in 0..20 {
-            let mut win = row("M", "brawlBall", [1, 10, 11], [2, 12, 13]);
+            let t = shift_time(i as i64 * TEST_STEP_SECS);
+
+            let mut win = row_at("M", "brawlBall", &t, [1, 10, 11], [2, 12, 13]);
             win.battle_hash = format!("a{i}");
             battles.push(win);
 
             for (tag, counter) in [("b", 3), ("c", 4)] {
-                let mut lose = row("M", "brawlBall", [counter, 12, 13], [1, 10, 11]);
+                let mut lose = row_at("M", "brawlBall", &t, [counter, 12, 13], [1, 10, 11]);
                 lose.battle_hash = format!("{tag}{i}");
                 battles.push(lose);
             }
@@ -2070,11 +2397,195 @@ mod tests {
                 opponent: 100 + i,
                 delta: 20.0 - i as f64,
                 samples: 30,
+                eff_samples: 30.0,
             })
             .collect();
         truncate_matchups(&mut matchups);
         assert_eq!(matchups.len(), MAP_MATCHUP_TOP_K);
         assert!(matchups.windows(2).all(|w| w[0].delta >= w[1].delta));
+    }
+
+    // -----------------------------------------------------------------------
+    // BO3 系列聚簇降权
+    // -----------------------------------------------------------------------
+
+    /// 构造一局指定时间/阵容的对局（`battle_hash` 由调用方补）。
+    fn battle_at(time: &str, winners: [i64; 3], losers: [i64; 3]) -> BattleRow {
+        row_at("M", "brawlBall", time, winners, losers)
+    }
+
+    #[test]
+    fn series_weights_merge_bo3_and_side_swap() {
+        // 3 局同阵容、30 秒一局；第 4 局交换红蓝边且仍在 10 分钟内
+        // -> 4 局同属一个系列，每局 1/4
+        let mut battles = Vec::new();
+        for (i, t) in [
+            "20261020T100000.000Z",
+            "20261020T100030.000Z",
+            "20261020T100100.000Z",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut r = battle_at(t, [1, 10, 11], [2, 12, 13]);
+            r.battle_hash = format!("w{i}");
+            battles.push(r);
+        }
+        let mut swapped = battle_at("20261020T100130.000Z", [2, 12, 13], [1, 10, 11]);
+        swapped.battle_hash = "swap".into();
+        battles.push(swapped);
+
+        // 换一张图：同阵容也不算同一系列
+        let mut other_map = row_at("N", "brawlBall", "20261020T100200.000Z", [1, 10, 11], [2, 12, 13]);
+        other_map.battle_hash = "other".into();
+        battles.push(other_map);
+
+        let refs: Vec<&BattleRow> = battles.iter().collect();
+        let w = series_weights(&refs);
+        for (i, v) in w.iter().take(4).enumerate() {
+            assert!((v - 0.25).abs() < 1e-12, "第 {i} 局系列权重应为 1/4，实际 {v}");
+        }
+        assert!(
+            (w[4] - 1.0).abs() < 1e-12,
+            "不同地图必须独立成簇，实际 {}",
+            w[4]
+        );
+    }
+
+    #[test]
+    fn series_window_is_ten_minutes_and_chains() {
+        let mk = |tag: &str, t: &str| {
+            let mut r = battle_at(t, [1, 10, 11], [2, 12, 13]);
+            r.battle_hash = tag.into();
+            r
+        };
+
+        // 恰好 600 秒：仍在同一系列
+        let exact = [
+            mk("a1", "20261020T100000.000Z"),
+            mk("a2", "20261020T101000.000Z"),
+        ];
+        let refs: Vec<&BattleRow> = exact.iter().collect();
+        assert!(series_weights(&refs).iter().all(|w| (w - 0.5).abs() < 1e-12));
+
+        // 601 秒：拆成两个系列
+        let split = [
+            mk("b1", "20261020T100000.000Z"),
+            mk("b2", "20261020T101001.000Z"),
+        ];
+        let refs: Vec<&BattleRow> = split.iter().collect();
+        assert!(series_weights(&refs).iter().all(|w| (w - 1.0).abs() < 1e-12));
+
+        // 链式合并：0s / 600s / 1200s，相邻两段都没超窗 -> 同一簇（3 局各 1/3）
+        let chain = [
+            mk("c1", "20261020T100000.000Z"),
+            mk("c2", "20261020T101000.000Z"),
+            mk("c3", "20261020T102000.000Z"),
+        ];
+        let refs: Vec<&BattleRow> = chain.iter().collect();
+        let w = series_weights(&refs);
+        assert!(w.iter().all(|v| (v - 1.0 / 3.0).abs() < 1e-12), "实际 {w:?}");
+    }
+
+    #[test]
+    fn series_weight_is_multiplied_into_decay_weight() {
+        let a = battle_at("20261020T100000.000Z", [1, 10, 11], [2, 12, 13]);
+        let b = battle_at("20261020T100030.000Z", [1, 10, 11], [2, 12, 13]);
+        let refs: Vec<&BattleRow> = vec![&a, &b];
+        let w = weigh_battles(&refs, 30.0);
+
+        // k = 2 -> 系列权重 0.5；最新局衰减 1.0，前一局衰减 0.5^(30/86400/30)
+        assert!((w[1].1 - 0.5).abs() < 1e-12, "实际 {}", w[1].1);
+        let decay = 0.5_f64.powf(30.0 / 86_400.0 / 30.0);
+        assert!((w[0].1 - 0.5 * decay).abs() < 1e-12, "实际 {}", w[0].1);
+    }
+
+    #[test]
+    fn bo3_series_counts_as_one_bp_group() {
+        // 20 轮 BO3：每轮 3 局同阵容（30 秒一局），轮间间隔 1 小时
+        let mut series = Vec::new();
+        for i in 0..20i64 {
+            for j in 0..3i64 {
+                let mut r = battle_at(&shift_time(i * 3600 + j * 30), [1, 10, 11], [2, 12, 13]);
+                r.battle_hash = format!("s{i}-{j}");
+                series.push(r);
+            }
+        }
+        // 对照组：20 场独立对局（间隔 > 10 分钟）
+        let standalone = battles_with("M", "brawlBall", [1, 10, 11], [2, 12, 13], 20);
+
+        let ids = vec![1, 2, 10, 11, 12, 13];
+        let out_series = analyze(&series, &dict(&ids), &opts());
+        let out_single = analyze(&standalone, &dict(&ids), &opts());
+
+        let s = matchup_on_map(find_map(&out_series, "M"), 1, 2).expect("应导出");
+        let c = matchup_on_map(find_map(&out_single, "M"), 1, 2).expect("应导出");
+
+        assert_eq!(
+            find_map(&out_series, "M").total_games,
+            60,
+            "地图总场次必须保留原始对局数"
+        );
+        assert_eq!(s.samples, 60, "原始对位样本数保留");
+        assert!(
+            (s.eff_samples - 20.0).abs() < 1e-9,
+            "20 轮 BO3 的有效样本应为 20，实际 {}",
+            s.eff_samples
+        );
+        // 一轮 3 局 BO3 与一场独立对局等价：有效样本与残差都必须一致
+        assert!((s.eff_samples - c.eff_samples).abs() < 1e-9);
+        assert!(
+            (s.delta - c.delta).abs() < 1e-9,
+            "BO3 降权后应与独立对局等价：{} vs {}",
+            s.delta,
+            c.delta
+        );
+    }
+
+    #[test]
+    fn two_game_series_halves_effective_samples() {
+        // 10 轮 BO2（每轮 2 局）-> 有效样本 10，原始样本 20
+        let mut battles = Vec::new();
+        for i in 0..10i64 {
+            for j in 0..2i64 {
+                let mut r = battle_at(&shift_time(i * 3600 + j * 30), [1, 10, 11], [2, 12, 13]);
+                r.battle_hash = format!("b{i}-{j}");
+                battles.push(r);
+            }
+        }
+        let out = analyze(&battles, &dict(&ALL), &opts());
+        let entry = matchup_on_map(find_map(&out, "M"), 1, 2).expect("应导出");
+        assert_eq!(entry.samples, 20);
+        assert!(
+            (entry.eff_samples - 10.0).abs() < 1e-9,
+            "10 轮 BO2 的有效样本应为 10，实际 {}",
+            entry.eff_samples
+        );
+    }
+
+    #[test]
+    fn series_cluster_report_counts_groups_not_battles() {
+        // 3 局同阵容（30 秒一局）+ 1 场独立对局（换图）
+        let mut battles = Vec::new();
+        for (i, t) in [
+            "20261020T100000.000Z",
+            "20261020T100030.000Z",
+            "20261020T100100.000Z",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut r = battle_at(t, [1, 10, 11], [2, 12, 13]);
+            r.battle_hash = format!("s{i}");
+            battles.push(r);
+        }
+        let mut solo = row_at("N", "brawlBall", "20261020T100200.000Z", [1, 10, 11], [2, 12, 13]);
+        solo.battle_hash = "solo".into();
+        battles.push(solo);
+
+        let (raw, groups) = series_cluster_report(&battles, 0);
+        assert_eq!(raw, 4, "原始对局数");
+        assert_eq!(groups, 2, "1 个 BO3 系列 + 1 场独立对局 = 2 个有效 BP 组");
     }
 
     // -----------------------------------------------------------------------
@@ -2109,6 +2620,7 @@ mod tests {
         let out = analyze(&[], &HashMap::new(), &opts());
         assert!(out.maps.is_empty());
         assert!(out.modes.is_empty());
+        assert!(out.global_matchups.is_empty());
         assert_eq!(out.total_battles, 0);
         assert_eq!(out.tier_audit.battles_total, 0);
     }

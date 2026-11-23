@@ -154,8 +154,9 @@ fn mock_then_analyze_produces_valid_meta() {
 
     let opts = AnalyzeOptions {
         bayes_prior_weight: 50.0,
-        matchup_prior_k: 50.0,
+        matchup_prior_k: 20.0,
         min_tier: 16,
+        decay_half_life_days: brawl_draft_core::analyzer::DEFAULT_DECAY_HALF_LIFE_DAYS,
         season_start: "2026-07-20".into(),
         roles,
     };
@@ -187,10 +188,10 @@ fn mock_then_analyze_produces_valid_meta() {
             assert!((0.0..=1.0).contains(&b.use_rate));
             assert!((0.0..=1.0).contains(&b.win_rate));
             assert!((0.0..=1.0).contains(&b.smoothed_wr));
-            // 地图级克制：2 位小数、显著（|delta| >= 2pp）、无自我对位
+            // 地图级克制：2 位小数、显著（|delta| >= 1.5pp）、无自我对位
             for m in &b.matchups {
                 assert!(
-                    m.delta.abs() >= 2.0,
+                    m.delta.abs() >= 1.5,
                     "地图级克制必须满足显著性门槛，实际 {}",
                     m.delta
                 );
@@ -220,7 +221,7 @@ fn mock_then_analyze_produces_valid_meta() {
             }
             for m in &b.matchups {
                 assert!(
-                    m.delta.abs() >= 2.0,
+                    m.delta.abs() >= 1.5,
                     "模式级克制必须满足显著性门槛，实际 {}",
                     m.delta
                 );
@@ -229,6 +230,43 @@ fn mock_then_analyze_produces_valid_meta() {
             assert!(b.matchups.len() <= 12, "模式级克制最多导出 12 条");
         }
     }
+
+    // ---- 全局兜底表（第三层）----
+    //
+    // 这一层**不按 |delta| 剪枝**，因此必须能查到「五五开」的对位；它正是
+    // 3×3 对位表不再大面积空白的来源。
+    assert!(
+        !out.global_matchups.is_empty(),
+        "2000 局 mock 数据应产出全局对位表"
+    );
+    assert!(
+        out.global_matchups.windows(2).all(|w| (w[0].a, w[0].b) < (w[1].a, w[1].b)),
+        "全局表必须按 (a, b) 升序且无重复"
+    );
+    let even_pairs = out
+        .global_matchups
+        .iter()
+        .filter(|m| m.delta.abs() < 1.0)
+        .count();
+    for m in &out.global_matchups {
+        assert!(m.a < m.b, "无序格式要求 a < b，实际 ({}, {})", m.a, m.b);
+        assert!(
+            m.n >= out.params.global_matchup_min_samples,
+            "全局表条目样本不足：{} < {}",
+            m.n,
+            out.params.global_matchup_min_samples
+        );
+        assert_eq!(
+            m.delta,
+            (m.delta * 100.0).round() / 100.0,
+            "全局表 delta 应为 2 位小数"
+        );
+        assert!(m.delta.abs() <= 100.0, "残差不可能超过 100pp");
+    }
+    assert!(
+        even_pairs > 0,
+        "不剪枝的全局表必须保留均势对位（|delta| < 1pp），否则前端无法区分五五开与无数据"
+    );
 
     // 克制关系严格反对称：A 对 B 的 delta 必须等于 B 对 A 的相反数
     let mut checked = 0usize;
@@ -249,7 +287,7 @@ fn mock_then_analyze_produces_valid_meta() {
     }
     assert!(checked > 0, "应至少校验到一组双向对位");
     let coverage = with_matchups as f64 / total_mode_brawlers as f64;
-    // 导出门槛是 eff_n >= 15 且 |delta| >= 2pp；mock 生成器本身接近可加模型
+    // 导出门槛是 eff_n >= 12 且 |delta| >= 1.5pp；mock 生成器本身接近可加模型
     // （队伍强度线性决定胜率），真实克制残差很少，因此覆盖率不会像旧口径那么高。
     // 这里只要求「存在一批有克制数据的英雄」，覆盖率本身不是正确性指标。
     assert!(
@@ -314,6 +352,7 @@ fn mock_then_analyze_produces_valid_meta() {
     assert_eq!(back.total_battles, 2000);
     assert_eq!(back.maps.len(), out.maps.len());
     assert_eq!(back.modes.len(), out.modes.len());
+    assert_eq!(back.global_matchups.len(), out.global_matchups.len());
     assert_eq!(back.schema_version, out.schema_version);
     assert!(out.to_json(true).unwrap().len() > json.len());
 }

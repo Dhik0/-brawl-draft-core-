@@ -104,13 +104,13 @@ fn run_git(args: &[&str]) -> Result<String> {
 mod tests {
     use super::*;
     use crate::models::output::{
-        AnalysisParams, BrawlerRef, MapBrawlerStat, MapMeta, Matchup, ModeBrawlerStat, ModeMeta,
-        PickOrder, RolesConfig, TierAudit, TierBucket,
+        AnalysisParams, BrawlerRef, GlobalMatchup, MapBrawlerStat, MapMeta, Matchup,
+        ModeBrawlerStat, ModeMeta, PickOrder, RolesConfig, TierAudit, TierBucket,
     };
 
     fn sample_meta() -> MetaOutput {
         MetaOutput {
-            schema_version: 3,
+            schema_version: 4,
             updated_at: "2026-11-21T00:00:00Z".to_string(),
             season_start: "2026-07-20".to_string(),
             total_battles: 42,
@@ -128,17 +128,20 @@ mod tests {
             },
             params: AnalysisParams {
                 bayes_prior_weight: 50.0,
-                matchup_smoothing_c: 50.0,
-                matchup_min_samples: 15,
-                map_matchup_min_samples: 15,
-                map_matchup_trust_samples: 15,
+                matchup_smoothing_c: 20.0,
+                matchup_min_samples: 8,
+                map_matchup_min_samples: 8,
+                map_matchup_trust_samples: 8,
                 decay_half_life_days: 30.0,
-                matchup_min_eff_samples: 15.0,
-                matchup_min_abs_delta: 0.02,
+                matchup_min_eff_samples: 8.0,
+                matchup_min_abs_delta: 0.015,
                 same_mode_weight: 0.6,
                 same_mode_cap: 40.0,
                 other_mode_weight: 0.3,
                 other_mode_cap: 25.0,
+                mode_matchup_min_eff_samples: 12.0,
+                global_matchup_min_samples: 10,
+                global_matchup_min_abs_delta: 0.0,
             },
             brawlers: vec![
                 BrawlerRef {
@@ -168,6 +171,7 @@ mod tests {
                         opponent: 16_000_001,
                         delta: 14.48,
                         samples: 18,
+                        eff_samples: 9.0,
                     }],
                 }],
             }],
@@ -186,8 +190,15 @@ mod tests {
                         opponent: 16_000_001,
                         delta: 14.48,
                         samples: 18,
+                        eff_samples: 9.0,
                     }],
                 }],
+            }],
+            global_matchups: vec![GlobalMatchup {
+                a: 16_000_000,
+                b: 16_000_001,
+                delta: 14.48,
+                n: 18,
             }],
             roles: RolesConfig {
                 version: 1,

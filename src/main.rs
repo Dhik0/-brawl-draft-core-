@@ -200,6 +200,7 @@ fn cmd_analyze(cfg: &Config, pretty: bool) -> Result<()> {
         bayes_prior_weight: cfg.bayes_prior_weight,
         matchup_prior_k: analyzer::MATCHUP_PRIOR_K,
         min_tier: cfg.min_tier,
+        decay_half_life_days: analyzer::DEFAULT_DECAY_HALF_LIFE_DAYS,
         season_start: cfg.season_start_raw.clone(),
         roles,
     };
@@ -208,6 +209,16 @@ fn cmd_analyze(cfg: &Config, pretty: bool) -> Result<()> {
     let report = publisher::write_meta(&cfg.dist_path, &meta, pretty)?;
 
     print_tier_audit(&meta);
+
+    // BO3 聚簇：同一批 6 人在 10 分钟内连打的小局按 1/k 降权，
+    // 因此「原始对局数」与「有效 BP 组数」不是一回事
+    let (raw_battles, effective_groups) = analyzer::series_cluster_report(&battles, cfg.min_tier);
+    println!(
+        "BO3 聚簇：{} 场原始对局 -> {} 个有效 BP 组（同阵容 10 分钟内连打按 1/k 降权，{} 秒窗口）",
+        raw_battles,
+        effective_groups,
+        analyzer::SERIES_CLUSTER_WINDOW_SECS
+    );
 
     println!(
         "分析完成：{} 场对局 / {} 张地图 / {} 个模式 / {} 名英雄 -> {} ({:.1} KB)",
@@ -262,7 +273,7 @@ fn cmd_analyze(cfg: &Config, pretty: bool) -> Result<()> {
         );
     }
 
-    // 克制条目：新口径只导出「有效样本够 + 残差显著」的边，条数比旧版少但更干净
+    // 克制条目：三层各自的门槛不同，这里分行打印，避免混淆
     let map_entries: usize = meta
         .maps
         .iter()
@@ -274,11 +285,31 @@ fn cmd_analyze(cfg: &Config, pretty: bool) -> Result<()> {
         .map(|m| m.brawlers.iter().map(|b| b.matchups.len()).sum::<usize>())
         .sum();
     println!(
-        "克制条目：地图级 {} 条 / 模式级 {} 条（门槛 eff_n >= {:.0} 且 |delta| >= {:.0}pp，K = {:.0}）",
+        "克制条目：地图级 {} 条（eff_n >= {:.0} 且 |delta| >= {:.1}pp）",
         map_entries,
-        mode_entries,
         meta.params.matchup_min_eff_samples,
-        meta.params.matchup_min_abs_delta * 100.0,
+        meta.params.matchup_min_abs_delta * 100.0
+    );
+    println!(
+        "          模式级 {} 条（eff_n >= {:.0} 且 |delta| >= {:.1}pp）",
+        mode_entries,
+        meta.params.mode_matchup_min_eff_samples,
+        meta.params.matchup_min_abs_delta * 100.0
+    );
+    // 全局兜底表：不剪枝，因此条数≈「样本够的对位数」，用于覆盖 3×3 对位空白
+    let even_pairs = meta
+        .global_matchups
+        .iter()
+        .filter(|m| m.delta.abs() < 1.0)
+        .count();
+    println!(
+        "          全局级 {} 条（n >= {}，不按 |delta| 剪枝；其中 |delta| < 1pp 的均势对位 {} 条）",
+        meta.global_matchups.len(),
+        meta.params.global_matchup_min_samples,
+        even_pairs
+    );
+    println!(
+        "          收缩强度 K = {:.0}（伪场次）",
         meta.params.matchup_smoothing_c
     );
 
