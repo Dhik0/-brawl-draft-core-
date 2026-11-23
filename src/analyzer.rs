@@ -80,18 +80,28 @@
 //!
 //! ## 综合评分（`score`）
 //!
-//! 胜率主导、出场率对数压缩、低样本软衰减：
+//! **固定标尺**，不再按单图最大 / 最小值拉伸到 0~100。旧做法（逐图 Min–Max +
+//! 冷门封顶 35）会把同一张图上微小的原始分差放大成 7 倍以上：一张图里
+//! 「胜率 57.6% 对 47.8%」的 9.8pp 差距被拉成 87.3 分对 12.7 分，看起来像实力
+//! 断层，实际只是同图排序噪声。现在所有地图共用一把绝对刻度：
 //!
 //! ```text
-//! rel      = games / (games + 40)                  // 可靠性
-//! wr_core  = 0.5 + (p_smoothed - 0.5) * rel        // 薄样本拉回中性
-//! use_term = ln(1 + share*k) / ln(1 + max_share*k) // 对数压缩，0~1
-//! raw      = 0.92 * wr_core + 0.08 * use_term
+//! mu_0  = 同模式其他地图的加权胜率 -> 全库（扣除本图）胜率 -> 0.5
+//! mu    = (W* + kappa * mu_0) / (N* + kappa)           // kappa = 40 伪场次
+//! sigma = sqrt(mu (1 - mu) / (N* + kappa + 1))         // 后验标准差
+//! u     = clamp(ln(share / 本图中位 share) / ln(5), -1, 1)   // 封顶热度项
+//! q     = mu - 0.5 * sigma + 0.01 * u
+//! score = clamp(50 + 50 * tanh((q - 0.5) / 0.15), 0, 100)   // 保留 1 位小数
 //! ```
 //!
-//! `share` 是槽位占比（`use_rate / 6`）。Min-Max 的分母只统计**有效英雄**
-//! （`games >= 10` 且 `share >= 0.5%`），极冷门英雄（`share < 0.3%`）的综合分
-//! 封顶 35，不允许靠「平滑后恰好 50% 胜率」排进中上游。
+//! * `W*` / `N*` 是该英雄在**本图**的有效胜场 / 有效场次（已含时间衰减与 BO3 降权）；
+//! * `mu_0` 取同模式**其他**地图的加权胜率——本图数据绝不参与自己的先验；
+//! * `50 + 50 * tanh(...)` 把 50 分锚在「胜率 50% 且零不确定性惩罚」的中性点：
+//!   `q = 0.65` ≈ 88 分，`q = 0.35` ≈ 12 分，但两端饱和，极端值之间不会互相放大；
+//! * 后验惩罚 `0.5 * sigma` **取代**旧的冷门硬封顶：样本越薄 `sigma` 越大，
+//!   分数自然被压向中线，而不是被一刀切在 35 分；
+//! * 热度项权重只有 `0.01`，在最陡处（`q = 0.5`）最多也只能贡献 ±3.3 分，
+//!   杜绝旧口径里「出场率单项拉出十几分」的情况。
 //!
 //! ## 顺位（`pick_order`）
 //!
@@ -146,23 +156,22 @@ use crate::models::output::{
     SCHEMA_VERSION,
 };
 
-/// 综合评分中胜率项的权重（其余给对数压缩后的出场率）。
+/// 贝叶斯收缩强度 κ（伪场次）：`mu = (W* + κ·mu_0) / (N* + κ)`。
 ///
-/// 0.92 是刻意偏向胜率的取值：出场率只用来在同一胜率档位内做区分，
-/// 不允许「9% 出场 + 52% 胜率」的热门卡线性碾压「2.5% 出场 + 56% 胜率」的强卡。
-const SCORE_WR_WEIGHT: f64 = 0.92;
-/// 出场率对数压缩系数（作用在「每场出场数」上，见 [`use_share`]）。
-const SCORE_USE_LOG_K: f64 = 300.0;
-/// 低样本软衰减系数：`rel = games / (games + K)`，K 越大对薄样本越保守。
-const SCORE_RELIABILITY_K: f64 = 40.0;
-/// 参与评分分母（Min-Max 区间）的最小原始场次。
-const SCORE_MIN_GAMES: u64 = 10;
-/// 进入评分分母的最小槽位占比（0.5%）。
-const SCORE_MIN_USE_SHARE: f64 = 0.005;
-/// 低于该槽位占比（0.3%）视为极冷门，综合分封顶。
-const SCORE_COLD_USE_SHARE: f64 = 0.003;
-/// 极冷门英雄的综合分上限，禁止排进中上游。
-const SCORE_COLD_CAP: f64 = 35.0;
+/// 同图有效场次不足 κ 时，平滑胜率被明显拉向同模式先验 `mu_0`；
+/// `N* = 40` 时先验与实测各占一半，`N* = 200` 时实测占 5/6。
+const SCORE_KAPPA: f64 = 40.0;
+/// 后验标准差对综合效用的惩罚系数：`q = mu - 0.5 * sigma + ...`。
+const SCORE_SIGMA_PENALTY: f64 = 0.5;
+/// 出场率（热度）项权重。刻意只给 0.01：热度只在同胜率档内做微调，
+/// 不允许像旧 Min–Max 那样把出场率差放大成十几分。
+const SCORE_USE_WEIGHT: f64 = 0.01;
+/// 热度项的归一尺度：槽位占比相对本图中位数差 5 倍即饱和到 ±1。
+const SCORE_USE_LOG_RATIO: f64 = 5.0;
+/// 先验均值 `mu_0` 可用所需的最小有效场次（同模式其他图 / 全库其他图）。
+const SCORE_PRIOR_MIN_EFF_GAMES: f64 = 20.0;
+/// `tanh` 标尺斜率：`q - 0.5` 每偏离 0.15，综合分走 `50*tanh(1) ≈ 38` 分。
+const SCORE_TANH_SCALE: f64 = 0.15;
 /// 每场 3v3 共 6 个英雄槽位，`use_rate` 合计 ≈ 6。
 const HERO_SLOTS_PER_BATTLE: f64 = 6.0;
 
@@ -315,12 +324,39 @@ pub fn analyze(
     }
     let (mode_excess, global_excess) = aggregate_excess(&cores, &mode_index);
 
+    // 3.5) 评分先验 `mu_0` 的原料：模式层 / 全库层的加权累加。
+    //
+    // 与克制残差不同，这里要的是**胜率**而不是超额胜场，所以直接累加 `games` /
+    // `wins`（已含时间衰减与 BO3 降权）。本图数据在 `prior_mean` 里扣除，
+    // 保证先验永远来自「其他地图」。
+    let mut mode_acc: HashMap<usize, HashMap<i64, Accum>> = HashMap::new();
+    let mut global_acc: HashMap<i64, Accum> = HashMap::new();
+    for core in &cores {
+        let slot = mode_acc
+            .entry(mode_index[core.mode.as_str()])
+            .or_default();
+        for (id, a) in &core.acc {
+            slot.entry(*id).or_default().merge(a);
+            global_acc.entry(*id).or_default().merge(a);
+        }
+    }
+
     // 4) 地图维度并行导出（评分 + 顺位 + 地图级克制）
     let mut maps: Vec<MapMeta> = cores
         .par_iter()
         .map(|core| {
             let idx = mode_index[core.mode.as_str()];
-            build_map(core, idx, &mode_excess, &global_excess, brawler_dict, opts)
+            // 每个模式索引都由上面那次遍历建过条目，索引访问不会 panic
+            build_map(
+                core,
+                idx,
+                &mode_acc[&idx],
+                &global_acc,
+                &mode_excess,
+                &global_excess,
+                brawler_dict,
+                opts,
+            )
         })
         .collect();
     maps.sort_by(|a, b| {
@@ -1129,6 +1165,8 @@ struct DraftCandidate {
 fn build_map(
     core: &MapCore,
     mode_idx: usize,
+    mode_acc: &HashMap<i64, Accum>,
+    global_acc: &HashMap<i64, Accum>,
     mode_excess: &HashMap<ModePairKey, Stratum>,
     global_excess: &HashMap<PairKey, Stratum>,
     dict: &HashMap<i64, String>,
@@ -1143,51 +1181,39 @@ fn build_map(
     // 不能把均势对位算进来，否则 FIRST / LAST 的分位会被摊平）
     let map_profiles = extract_profiles(&core.pairs, &display_delta);
 
-    let max_use = core
-        .acc
-        .values()
-        .map(|a| ratio(a.games, core.total_weight))
-        .fold(0.0_f64, f64::max);
+    // 热度项的基准：本图槽位占比中位数（比均值更抗「一两个超热门英雄」的拖拽）
+    let median_share = median_use_share(core);
 
-    // 第一轮：算平滑胜率、出场率与未归一化的综合分
-    let mut pre: Vec<(i64, Accum, f64, f64)> = core
+    let mut candidates: Vec<DraftCandidate> = core
         .acc
         .iter()
         .map(|(id, a)| {
             let use_rate = ratio(a.games, core.total_weight);
+            // 顺位用的强度口径不变：固定 50% 先验的平滑胜率减去被康特惩罚
             let smoothed = smoothed_rate(a.wins, a.games, opts.bayes_prior_weight);
-            let raw_score = raw_score_of(a.raw_games, use_rate, smoothed, max_use);
-            (*id, *a, smoothed, raw_score)
-        })
-        .collect();
 
-    // 第二轮：Min-Max 缩放到 0~100。
-    //
-    // 区间只用**有效英雄**（场次够 + 出场率够）计算：极冷门英雄的原始分
-    // 本来就贴近下限，把它们算进分母会把整个有效区间压扁，制造断崖。
-    let (raw_min, raw_max) = pre
-        .iter()
-        .filter(|(_, a, _, _)| is_score_eligible(a.raw_games, ratio(a.games, core.total_weight)))
-        .map(|p| p.3)
-        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| {
-            (lo.min(v), hi.max(v))
-        });
-    let span = raw_max - raw_min;
-    let degenerate = !span.is_finite() || span <= 1e-12;
+            // 综合分走固定标尺：先验均值 -> 贝叶斯平滑 + 后验惩罚 -> 封顶热度项
+            let mu_0 = prior_mean(*id, a, mode_acc, global_acc);
+            let u = popularity_term(use_share(use_rate), median_share);
+            let q = raw_score_of(a.wins, a.games, mu_0, u);
+            let score = normalize_score(q);
+            let (mu, sigma) = smoothed_win_rate(a.wins, a.games, mu_0);
 
-    let mut candidates: Vec<DraftCandidate> = pre
-        .drain(..)
-        .map(|(id, a, smoothed, raw_score)| {
-            let use_rate = ratio(a.games, core.total_weight);
-            let score = normalize_score(raw_score, raw_min, span, degenerate);
-            // 极冷门英雄（场次或出场率不足）不给高分，直接封顶
-            let score = if is_cold(a.raw_games, use_rate) {
-                score.min(SCORE_COLD_CAP)
-            } else {
-                score
-            };
+            // 评分诊断：只在 `--log debug` 时输出，用来核对先验与惩罚的量级
+            tracing::debug!(
+                map = %core.map_name,
+                hero = %name_of(*id, dict),
+                n_star = a.games,
+                w_star = a.wins,
+                mu0 = mu_0,
+                mu = mu,
+                sigma = sigma,
+                u = u,
+                q = q,
+                score = score,
+            );
 
-            let (worst_pp, spread_pp) = match map_profiles.get(&id) {
+            let (worst_pp, spread_pp) = match map_profiles.get(id) {
                 Some(p) => (Some(p.worst_pp), p.spread_pp),
                 None => (None, 0.0),
             };
@@ -1198,20 +1224,20 @@ fn build_map(
                 .unwrap_or(0.0);
             let flex = smoothed - FLEX_PENALTY * penalty;
 
-            let mut matchups = matchups_of(id, &core.pairs, &display_delta);
+            let mut matchups = matchups_of(*id, &core.pairs, &display_delta);
             let edge_count = matchups.len();
             truncate_matchups(&mut matchups);
 
             DraftCandidate {
                 stat: MapBrawlerStat {
-                    id,
-                    name: name_of(id, dict),
+                    id: *id,
+                    name: name_of(*id, dict),
                     games: a.raw_games,
                     wins: a.raw_wins,
                     win_rate: round4(ratio(a.wins, a.games)),
                     smoothed_wr: round4(smoothed),
                     use_rate: round4(use_rate),
-                    score: round4(score),
+                    score,
                     pick_order: PickOrder::Middle,
                     matchups,
                 },
@@ -1316,52 +1342,112 @@ fn use_share(use_rate: f64) -> f64 {
     use_rate / HERO_SLOTS_PER_BATTLE
 }
 
-/// 未归一化的综合分：胜率主导 + 对数压缩的出场率。
+/// 本图槽位占比的中位数（热度项的基准）。
 ///
-/// * `wr_core = 0.5 + (p - 0.5) * rel`，`rel = games/(games+K)`：
-///   0~5 场的冷门英雄即便平滑后停在 50%，也会被可靠性系数拉回中性，
-///   不会白嫖 50% 胜率排到正常英雄前面；
-/// * `use_term` 用 `ln(1 + share*K)` 再除以榜首值做 0~1 归一，
-///   把 0.5% 与 10% 的差距从 20 倍压到 3 倍左右。
-fn raw_score_of(games: u64, use_rate: f64, smoothed_wr: f64, max_use_rate: f64) -> f64 {
-    let g = games as f64;
-    let rel = g / (g + SCORE_RELIABILITY_K);
-    let wr_core = 0.5 + (smoothed_wr - 0.5) * rel;
-
-    let denom = (1.0 + use_share(max_use_rate) * SCORE_USE_LOG_K).ln();
-    let use_term = if denom <= f64::EPSILON {
-        0.0
-    } else {
-        ((1.0 + use_share(use_rate) * SCORE_USE_LOG_K).ln() / denom).clamp(0.0, 1.0)
-    };
-
-    SCORE_WR_WEIGHT * wr_core + (1.0 - SCORE_WR_WEIGHT) * use_term
-}
-
-/// 是否进入 Min-Max 分母（样本与出场率都要够）。
-fn is_score_eligible(games: u64, use_rate: f64) -> bool {
-    games >= SCORE_MIN_GAMES && use_share(use_rate) >= SCORE_MIN_USE_SHARE
-}
-
-/// 是否属于极冷门（综合分必须封顶）。
-///
-/// 门槛比 [`is_score_eligible`] 更宽松：0.3%~0.5% 槽位的英雄仍参与归一化，
-/// 只是不给它进分母；低于 0.3% 或不足 10 场的直接压到低分段。
-fn is_cold(games: u64, use_rate: f64) -> bool {
-    games < SCORE_MIN_GAMES || use_share(use_rate) < SCORE_COLD_USE_SHARE
-}
-
-/// 归一化到 0~100，并对极冷门英雄封顶。
-fn normalize_score(raw: f64, raw_min: f64, span: f64, degenerate: bool) -> f64 {
-    if degenerate {
-        // 只有一名英雄，或所有英雄指标完全一致：给中性分，避免虚高到 100
-        return 50.0;
-    }
-    let score = (raw - raw_min) / span * 100.0;
-    if !score.is_finite() {
+/// 用中位数而不是均值：一张图上常有一两个超热门英雄（槽位占比 20%+），
+/// 均值会被它们拽高，导致多数英雄的热度项系统性偏负。
+fn median_use_share(core: &MapCore) -> f64 {
+    let mut shares: Vec<f64> = core
+        .acc
+        .values()
+        .map(|a| use_share(ratio(a.games, core.total_weight)))
+        .collect();
+    if shares.is_empty() {
         return 0.0;
     }
-    score.clamp(0.0, 100.0)
+    shares.sort_by(f64::total_cmp);
+    let mid = shares.len() / 2;
+    if shares.len() % 2 == 0 {
+        (shares[mid - 1] + shares[mid]) / 2.0
+    } else {
+        shares[mid]
+    }
+}
+
+/// 封顶的对数热度项 `u ∈ [-1, 1]`。
+///
+/// `u = ln(share / 本图中位 share) / ln(5)`，即「比中位英雄热门 5 倍」就饱和到 +1，
+/// 「冷门 5 倍」饱和到 -1。乘以权重 0.01 后，最陡处也只值 ±3.3 分——
+/// 出场率只在同胜率档内做区分，不允许单独把分数拉开。
+fn popularity_term(share: f64, median_share: f64) -> f64 {
+    let eps = 1e-9;
+    let dev = (share.max(0.0) + eps).ln() - (median_share.max(0.0) + eps).ln();
+    let u = dev / SCORE_USE_LOG_RATIO.ln();
+    if !u.is_finite() {
+        return 0.0;
+    }
+    u.clamp(-1.0, 1.0)
+}
+
+/// 先验均值 `mu_0`：同模式**其他**地图的加权胜率 -> 全库（扣除本图）胜率 -> 0.5。
+///
+/// 本图数据永远不参与自己的先验（`own` 会被扣掉），否则「先验」就退化成本图的
+/// 原始胜率，`kappa` 收缩失去意义。两条外部路径都要求有效场次
+/// `>= SCORE_PRIOR_MIN_EFF_GAMES`，否则视为样本不足继续回退。
+fn prior_mean(
+    id: i64,
+    own: &Accum,
+    mode_acc: &HashMap<i64, Accum>,
+    global_acc: &HashMap<i64, Accum>,
+) -> f64 {
+    if let Some(total) = mode_acc.get(&id) {
+        let n = total.games - own.games;
+        let w = total.wins - own.wins;
+        if n >= SCORE_PRIOR_MIN_EFF_GAMES {
+            return ratio(w, n).clamp(0.0, 1.0);
+        }
+    }
+    if let Some(total) = global_acc.get(&id) {
+        let n = total.games - own.games;
+        let w = total.wins - own.wins;
+        if n >= SCORE_PRIOR_MIN_EFF_GAMES {
+            return ratio(w, n).clamp(0.0, 1.0);
+        }
+    }
+    0.5
+}
+
+/// 贝叶斯平滑胜率与后验标准差：`(mu, sigma)`。
+///
+/// ```text
+/// mu    = (W* + kappa * mu_0) / (N* + kappa)
+/// sigma = sqrt(mu (1 - mu) / (N* + kappa + 1))
+/// ```
+///
+/// `sigma` 随 `N*` 单调下降：薄样本被惩罚得更重，这正是旧「冷门硬封顶」想解决
+/// 的问题，但用连续函数表达，不会在某个常数上制造断崖。
+fn smoothed_win_rate(w_star: f64, n_star: f64, mu_0: f64) -> (f64, f64) {
+    let k = SCORE_KAPPA;
+    let mu_0 = mu_0.clamp(0.0, 1.0);
+    let denom = n_star + k;
+    let mu = if denom <= f64::EPSILON {
+        mu_0
+    } else {
+        ((w_star + k * mu_0) / denom).clamp(0.0, 1.0)
+    };
+    let var = (mu * (1.0 - mu) / (n_star + k + 1.0)).max(0.0);
+    (mu, var.sqrt())
+}
+
+/// 综合效用 `q = mu - 0.5 * sigma + 0.01 * u`。
+///
+/// 全部输入都是绝对量（胜率、后验标准差、封顶热度偏移），**没有任何逐图
+/// Min–Max 拉伸**，所以同一份表现放在任何地图上都会得到同一个分数。
+fn raw_score_of(w_star: f64, n_star: f64, mu_0: f64, u: f64) -> f64 {
+    let (mu, sigma) = smoothed_win_rate(w_star, n_star, mu_0);
+    mu - SCORE_SIGMA_PENALTY * sigma + SCORE_USE_WEIGHT * u
+}
+
+/// 固定 `tanh` 标尺：`50 + 50 * tanh((q - 0.5) / 0.15)`，保留 1 位小数。
+///
+/// 50 分锚定「胜率 50%、无不确定性惩罚」的中性点；两端饱和保证极端值之间
+/// 不会像 Min–Max 那样互相放大。`q = 0.65` ≈ 88 分，`q = 0.35` ≈ 12 分。
+fn normalize_score(q: f64) -> f64 {
+    if !q.is_finite() {
+        return 50.0;
+    }
+    let score = 50.0 + 50.0 * ((q - 0.5) / SCORE_TANH_SCALE).tanh();
+    round1(score.clamp(0.0, 100.0))
 }
 
 /// 是否有资格参与 FIRST / LAST 分位划分。
@@ -2381,16 +2467,223 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn top_brawler_score_is_100_and_ordering_is_desc() {
+    fn top_brawler_score_is_high_and_ordering_is_desc() {
         let battles = battles_with("M", "brawlBall", [1, 10, 11], [2, 12, 13], 30);
         let ids = vec![1, 2, 10, 11, 12, 13];
         let out = analyze(&battles, &dict(&ids), &opts());
         let map = &out.maps[0];
 
         assert_eq!(map.brawlers[0].id, 1);
-        assert!((map.brawlers[0].score - 100.0).abs() < 1e-9);
+        // 固定标尺：30 场全胜 + 无外部先验 -> mu = 50/70，约 92 分，不再被拉成 100
+        assert!(
+            map.brawlers[0].score > 85.0 && map.brawlers[0].score < 100.0,
+            "30 场全胜应落在高分段但不必等于 100，实际 {}",
+            map.brawlers[0].score
+        );
         assert!(map.brawlers.windows(2).all(|w| w[0].score >= w[1].score));
-        assert!(map.brawlers.last().unwrap().score.abs() < 1e-9);
+        // 30 场全败：先验 0.5 把 mu 拉到 20/70，约 4 分
+        assert!(
+            map.brawlers.last().unwrap().score < 10.0,
+            "30 场全败应落在低分段，实际 {}",
+            map.brawlers.last().unwrap().score
+        );
+    }
+
+    #[test]
+    fn score_is_absolute_not_per_map_normalized() {
+        // 同一模式的两张图：1 号在两张图的战绩完全相同（20 场 14 胜），
+        // 但两张图的「整体强度分布」差别极大——M1 的支援组 20 战全胜，
+        // M2 的支援组 20 战 10 胜。
+        //
+        // 出场次数与英雄集合完全一致，所以热度项 `u` 也一致；此时 1 号在两图的
+        // 综合分必须**逐位相等**。旧的逐图 Min-Max 会因为另一批英雄的极差不同
+        // 而给出两个不同的分数。
+        let mut battles = Vec::new();
+        let mut i = 0usize;
+        for map in ["M1", "M2"] {
+            // 1 号：14 胜 6 负（两张图完全一致）
+            for k in 0..20 {
+                let (w, l) = if k < 14 {
+                    ([1, 10, 11], [2, 12, 13])
+                } else {
+                    ([2, 12, 13], [1, 10, 11])
+                };
+                let mut r = row_at(map, "brawlBall", &shift_time(i as i64 * TEST_STEP_SECS), w, l);
+                r.battle_hash = format!("core-{i}");
+                battles.push(r);
+                i += 1;
+            }
+            // 支援组：M1 全胜、M2 五五开
+            let support_wins = if map == "M1" { 20 } else { 10 };
+            for k in 0..20 {
+                let (w, l) = if k < support_wins {
+                    ([3, 4, 5], [6, 7, 8])
+                } else {
+                    ([6, 7, 8], [3, 4, 5])
+                };
+                let mut r = row_at(map, "brawlBall", &shift_time(i as i64 * TEST_STEP_SECS), w, l);
+                r.battle_hash = format!("sup-{i}");
+                battles.push(r);
+                i += 1;
+            }
+        }
+
+        let ids = vec![1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13];
+        let out = analyze(&battles, &dict(&ids), &opts());
+        let one_m1 = find_map(&out, "M1")
+            .brawlers
+            .iter()
+            .find(|b| b.id == 1)
+            .unwrap();
+        let one_m2 = find_map(&out, "M2")
+            .brawlers
+            .iter()
+            .find(|b| b.id == 1)
+            .unwrap();
+
+        assert_eq!(one_m1.games, 20);
+        assert_eq!(one_m2.games, 20);
+        assert_eq!(
+            one_m1.score, one_m2.score,
+            "同样的战绩必须得到同样的综合分（固定标尺），实际 M1={} M2={}",
+            one_m1.score, one_m2.score
+        );
+        // 对照：同一位英雄的分数不随「本图其他英雄的极差」变化，但会随战绩变化
+        let three_m1 = find_map(&out, "M1")
+            .brawlers
+            .iter()
+            .find(|b| b.id == 3)
+            .unwrap();
+        let three_m2 = find_map(&out, "M2")
+            .brawlers
+            .iter()
+            .find(|b| b.id == 3)
+            .unwrap();
+        assert_ne!(three_m1.score, three_m2.score);
+    }
+
+    #[test]
+    fn prior_mean_prefers_same_mode_other_maps() {
+        let own = Accum {
+            games: 20.0,
+            wins: 10.0,
+            raw_games: 20,
+            raw_wins: 10,
+        };
+        // 同模式其他图 60 场 42 胜 -> mu_0 = 0.7
+        let mode_acc = HashMap::from([(
+            1i64,
+            Accum {
+                games: 80.0,
+                wins: 52.0,
+                raw_games: 80,
+                raw_wins: 52,
+            },
+        )]);
+        let global_acc = HashMap::from([(
+            1i64,
+            Accum {
+                games: 200.0,
+                wins: 120.0,
+                raw_games: 200,
+                raw_wins: 120,
+            },
+        )]);
+        assert!((prior_mean(1, &own, &mode_acc, &global_acc) - 0.7).abs() < 1e-12);
+
+        // 同模式其他图只剩 12 场（< 20）-> 回退全库（扣除本图）：110/180
+        let thin_mode = HashMap::from([(
+            1i64,
+            Accum {
+                games: 32.0,
+                wins: 22.0,
+                raw_games: 32,
+                raw_wins: 22,
+            },
+        )]);
+        let fallback = prior_mean(1, &own, &thin_mode, &global_acc);
+        assert!((fallback - 110.0 / 180.0).abs() < 1e-12, "实际 {fallback}");
+
+        // 全库也不足 -> 中性 0.5
+        let empty: HashMap<i64, Accum> = HashMap::new();
+        assert_eq!(prior_mean(9, &own, &empty, &empty), 0.5);
+    }
+
+    #[test]
+    fn posterior_penalty_punishes_thin_samples() {
+        // 2 场全胜 vs 400 场 51.9%：mu_0 = 0.5 时薄样本被拉向中线
+        let tiny = raw_score_of(2.0, 2.0, 0.5, 0.0);
+        let solid = raw_score_of(207.6, 400.0, 0.5, 0.0);
+        assert!(
+            tiny < solid,
+            "同样胜率下，薄样本的综合效用必须更低：tiny={tiny:.4} solid={solid:.4}"
+        );
+        let (mu, sigma) = smoothed_win_rate(2.0, 2.0, 0.5);
+        assert!((mu - 22.0 / 42.0).abs() < 1e-12, "实际 mu={mu}");
+        assert!(sigma > 0.07, "2 场样本的后验标准差应明显偏大，实际 {sigma}");
+        // 惩罚把薄样本压到标尺中线以下（旧的硬封顶 35 分已被取代）
+        assert!(normalize_score(tiny) < 50.0);
+    }
+
+    #[test]
+    fn score_weights_win_rate_above_popularity() {
+        // 热门卡：1000 场 52.8% 胜率、热度项拉满（+1）
+        let popular = raw_score_of(528.0, 1000.0, 0.5, 1.0);
+        // 冷门强卡：370 场 56.9% 胜率、热度项触底（-1）
+        let strong = raw_score_of(210.53, 370.0, 0.5, -1.0);
+        assert!(
+            strong > popular,
+            "高胜率冷门卡应压过高出场低胜率卡：strong={strong:.4} popular={popular:.4}"
+        );
+        // 热度项权重只有 0.01：拉满与触底的差距不超过 0.02（在 q 上）
+        let neutral = raw_score_of(528.0, 1000.0, 0.5, 0.0);
+        assert!(
+            (popular - neutral).abs() <= SCORE_USE_WEIGHT + 1e-12,
+            "热度项不允许主导排序，实际差 {}",
+            popular - neutral
+        );
+    }
+
+    #[test]
+    fn cold_hero_is_penalized_by_posterior_not_hard_cap() {
+        // 3 号只出场 2 场且全胜，其余英雄各 30+ 场
+        let mut battles = battles_with("M", "bounty", [1, 10, 11], [2, 12, 13], 30);
+        battles.extend(battles_with("M", "bounty", [3, 10, 11], [2, 12, 13], 2));
+
+        let ids = vec![1, 2, 3, 10, 11, 12, 13];
+        let out = analyze(&battles, &dict(&ids), &opts());
+        let map = &out.maps[0];
+
+        let cold = map.brawlers.iter().find(|b| b.id == 3).unwrap();
+        assert_eq!(cold.games, 2);
+        // 2 场全胜会被先验拉回 22/42，再被 sigma 惩罚压到中线以下
+        assert!(
+            cold.score < 50.0,
+            "极薄样本的综合分应低于标尺中线，实际 {}",
+            cold.score
+        );
+        assert!(cold.score > 0.0, "不再有硬封顶，也不应被压成 0");
+        assert!(
+            cold.score < map.brawlers[0].score - 20.0,
+            "薄样本必须明显落后于榜首：cold={} top={}",
+            cold.score,
+            map.brawlers[0].score
+        );
+        assert_eq!(
+            cold.pick_order,
+            PickOrder::Middle,
+            "极冷门英雄禁止标 FIRST"
+        );
+        assert!(!is_pick_eligible(cold.games, cold.use_rate, 0));
+    }
+
+    #[test]
+    fn eligible_range_keeps_top_scores_close() {
+        // 固定标尺下，两名强卡的分差只反映真实胜率差，不会被拉伸成断崖
+        let a = normalize_score(raw_score_of(210.53, 370.0, 0.5, 0.0)); // 56.9%
+        let b = normalize_score(raw_score_of(528.0, 1000.0, 0.5, 0.0)); // 52.8%
+        let gap = a - b;
+        assert!(gap > 0.0 && gap < 20.0, "顶部综合分差应有限，实际 {gap:.1}");
     }
 
     #[test]
@@ -2483,67 +2776,6 @@ mod tests {
                 .count(),
             2
         );
-    }
-
-    #[test]
-    fn score_weights_win_rate_above_popularity() {
-        // 热门卡：58% 出场、52.8% 胜率（Shooting Star 的 PIPER 量级）
-        let popular = raw_score_of(1000, 0.58, 0.528, 0.59);
-        // 冷门强卡：18% 出场、56.9% 胜率（MR. P 量级）
-        let strong = raw_score_of(370, 0.18, 0.569, 0.59);
-        assert!(
-            strong > popular,
-            "高胜率中等出场应压过高出场低胜率：strong={strong:.4} popular={popular:.4}"
-        );
-    }
-
-    #[test]
-    fn score_shrinks_tiny_samples_toward_neutral() {
-        // 2 场全胜：即便平滑后胜率偏高，可靠性系数也会把胜率项拉回 50% 附近
-        let tiny = raw_score_of(2, 0.01, 0.519, 0.59);
-        let solid = raw_score_of(400, 0.18, 0.519, 0.59);
-        assert!(
-            tiny < solid,
-            "同样胜率下，薄样本的综合分必须更低：tiny={tiny:.4} solid={solid:.4}"
-        );
-        // 薄样本的胜率项应该非常接近 0.5
-        let rel = 2.0 / (2.0 + SCORE_RELIABILITY_K);
-        let wr_core = 0.5 + (0.519 - 0.5) * rel;
-        assert!((wr_core - 0.5).abs() < 0.002, "薄样本胜率项应贴近中性");
-    }
-
-    #[test]
-    fn cold_hero_gets_low_score_and_no_first_label() {
-        // 3 号只出场 2 场且全胜，其余英雄各 30+ 场
-        let mut battles = battles_with("M", "bounty", [1, 10, 11], [2, 12, 13], 30);
-        battles.extend(battles_with("M", "bounty", [3, 10, 11], [2, 12, 13], 2));
-
-        let ids = vec![1, 2, 3, 10, 11, 12, 13];
-        let out = analyze(&battles, &dict(&ids), &opts());
-        let map = &out.maps[0];
-
-        let cold = map.brawlers.iter().find(|b| b.id == 3).unwrap();
-        assert_eq!(cold.games, 2);
-        assert!(
-            cold.score <= SCORE_COLD_CAP,
-            "极冷门英雄综合分必须封顶在 {SCORE_COLD_CAP}，实际 {}",
-            cold.score
-        );
-        assert_eq!(
-            cold.pick_order,
-            PickOrder::Middle,
-            "极冷门英雄禁止标 FIRST"
-        );
-        assert!(!is_pick_eligible(cold.games, cold.use_rate, 0));
-    }
-
-    #[test]
-    fn eligible_range_keeps_top_scores_close() {
-        // 榜首与次席的原始分差不应被出场率拉开成断崖
-        let a = raw_score_of(400, 0.18, 0.569, 0.59);
-        let b = raw_score_of(1000, 0.58, 0.528, 0.59);
-        let gap = (a - b).abs();
-        assert!(gap < 0.05, "顶部原始分差过大：{gap:.4}");
     }
 
     #[test]

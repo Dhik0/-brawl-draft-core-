@@ -179,9 +179,20 @@ fn mock_then_analyze_produces_valid_meta() {
         let slots: u64 = map.brawlers.iter().map(|b| b.games).sum();
         assert_eq!(slots, map.total_games * 6, "{} 出场位统计不闭合", map.map_name);
 
-        // 每图最高分归一化为 100
+        // 综合分是**固定标尺**（`50 + 50*tanh((q-0.5)/0.15)`），不再按单图
+        // 极值拉伸到 0/100：榜首只需要是最高分，不必恰好等于 100。
         let top = &map.brawlers[0];
-        assert!((top.score - 100.0).abs() < 1e-9, "{} 最高分应为 100", map.map_name);
+        assert!(
+            top.score > 50.0 && top.score <= 100.0,
+            "{} 榜首应落在标尺上半区，实际 {}",
+            map.map_name,
+            top.score
+        );
+        assert!(
+            map.brawlers.iter().all(|b| (0.0..=100.0).contains(&b.score)),
+            "{} 综合分必须落在 0~100",
+            map.map_name
+        );
         assert!(map.brawlers.windows(2).all(|w| w[0].score >= w[1].score));
 
         for b in &map.brawlers {
