@@ -117,10 +117,13 @@
 //! coverage = Σ w_B[有对位数据] / Σ w_B[本图全部对手]      // 对位证据覆盖率
 //! Q20      = 加权 20 分位（delta_pp 升序累计）            // 盲选下限风险
 //! Q80      = 加权 80 分位                                  // 针对选出时的上限红利
+//! median   = 本图合格英雄出场数中位数                      // 主流出场基准
 //!
-//! FIRST  <=> coverage >= 0.70 且 Q20 >= -2pp 且 mu >= 0.49
-//! LAST   <=> coverage >= 0.70 且 Q80 >= +3pp 且 Q20 <= -3pp
-//! 其余   =>  MIDDLE
+//! FIRST <=> coverage >= 0.70 且 games >= median 且 Q20 >= -2pp 且 mu >= 0.49
+//! LAST  <=> coverage >= 0.70 且（ Q80 >= +2.2pp 且 Q20 <= -2.2pp          // 分支 A
+//!                           或 games < median 且 Q80 >= +3pp
+//!                              且 Q80 - Q20 >= 4.5pp ）                  // 分支 B
+//! 其余  =>  MIDDLE
 //! ```
 //!
 //! * `w_B` 是 `B` 在本图的出场权重（`Accum.games`，已含时间衰减与 BO3 降权），
@@ -128,7 +131,13 @@
 //! * 分位数按 `delta_pp(A vs B)` **升序**累计，视角统一到「A 的优势」：查表只存
 //!   规范方向 `lo < hi`，反查 `B < A` 时必须取负号；
 //! * `coverage < 0.70` 视为对位证据不足，直接 `MIDDLE`（不打先手 / 后手标签）；
-//! * 两个标签互斥：`FIRST` 要求 `Q20 >= -2`，`LAST` 要求 `Q20 <= -3`。
+//! * `FIRST` 额外要求 `games >= median`：低出场率英雄的分位数只由少量对局撑起来，
+//!   幸存者偏差容易把「刚好没撞上天敌」的冷门位算成万能先手；
+//! * 分支 A 的 `±2.2pp` 按 BO3 降权后的残差尺度校准（`K = 20` 的收缩会把残差
+//!   压小，旧的 `±3.0pp` 在新尺度下过严，全库只剩 4.9% 能达标）；
+//! * 分支 B 收留「冷门但上限极高」的偷鸡位：出场不足主流、`Q80` 高、极差大；
+//! * 互斥性：分支 A 要求 `Q20 <= -2.2`（`FIRST` 要求 `>= -2.0`），分支 B 要求
+//!   `games < median`（`FIRST` 要求 `>= median`），两条路径都不会与 `FIRST` 冲突。
 //!
 //! `flex` 的「被康特惩罚」只看**本图**的对位 delta，不用模式级结果：
 //! 同一英雄在草图与开阔图上的克制差异很大，拿模式级最差对位去评一张开阔图，
@@ -286,10 +295,17 @@ const PICK_MIN_MATCHUP_COVERAGE: f64 = 0.70;
 const FIRST_MIN_Q20_PP: f64 = -2.0;
 /// `FIRST` 的本图平滑胜率下限：防止弱势英雄靠「打谁都微弱劣势」混进先手。
 const FIRST_MIN_MU: f64 = 0.49;
-/// `LAST`（看阵容反选）的加权 80 分位下限（pp）：必须有足够高的上限红利。
-const LAST_MIN_Q80_PP: f64 = 3.0;
-/// `LAST` 的加权 20 分位上限（pp）：盲选必须真的容易被天敌打穿。
-const LAST_MAX_Q20_PP: f64 = -3.0;
+/// `LAST` 分支 A（双向克制波动）的加权 80 分位下限（pp）。
+///
+/// 从 `+3.0` 放宽到 `+2.2`：BO3 系列降权把有效样本砍掉一半以上，残差被 `K = 20`
+/// 的收缩同步压小，`±3.0` 在新尺度下等价于旧口径的 `±4~5pp`，全库只剩 4.9% 能达标。
+const LAST_SWING_MIN_Q80_PP: f64 = 2.2;
+/// `LAST` 分支 A 的加权 20 分位上限（pp）：盲选必须真的容易被天敌打穿。
+const LAST_SWING_MAX_Q20_PP: f64 = -2.2;
+/// `LAST` 分支 B（冷门高上限偷鸡位）的加权 80 分位下限（pp）。
+const LAST_THIN_MIN_Q80_PP: f64 = 3.0;
+/// `LAST` 分支 B 的最小极差（`Q80 - Q20`，pp）：上限与下限必须拉开足够距离。
+const LAST_THIN_MIN_SPREAD_PP: f64 = 4.5;
 /// 存在明显劣势对位时的强度惩罚系数。
 const FLEX_PENALTY: f64 = 0.30;
 /// 最差对位 delta 高于该值（pp）不扣分。
@@ -1409,42 +1425,90 @@ fn build_map(
     }
 }
 
+/// 本图合格英雄出场数的中位数（主流出场基准）。
+///
+/// 只有 `eligible` 的英雄参与取中位数：极冷门英雄（本图 20 场以下）本来就不参与
+/// 顺位判定，把它们算进基准会把中位数拽到「谁都能过」的位置。
+///
+/// 返回 `None` 表示本图没有任何合格英雄——此时任何标签都不会被判定。
+fn eligible_median_games(candidates: &[DraftCandidate]) -> Option<f64> {
+    let mut games: Vec<f64> = candidates
+        .iter()
+        .filter(|c| c.eligible)
+        .map(|c| c.stat.games as f64)
+        .collect();
+    if games.is_empty() {
+        return None;
+    }
+    games.sort_by(f64::total_cmp);
+    let mid = games.len() / 2;
+    Some(if games.len() % 2 == 0 {
+        (games[mid - 1] + games[mid]) / 2.0
+    } else {
+        games[mid]
+    })
+}
+
 /// 按「本图对手出场率加权分位数」判定顺位，**不再有固定配额**。
 ///
 /// 旧实现按 `round(22%)` 强行切名额：天敌极多的英雄挤不进 `LAST` 名额后会被
 /// 剩余名额「顺手」塞进 `FIRST`，结论直接反了。配额制把「名额」和「结论」绑死，
 /// 而结论应该由分布本身决定。
 ///
-/// 判定顺序（两个标签互斥，`Q20` 条件相反）：
+/// 判定顺序（各分支互斥）：
 ///
 /// 1. `coverage < 0.70` -> `MIDDLE`（对位证据不足，不下结论）；
-/// 2. `Q20 >= -2pp` 且 `mu >= 0.49` -> `FIRST`（盲选安全，且本身不是弱势英雄）；
-/// 3. `Q80 >= +3pp` 且 `Q20 <= -3pp` -> `LAST`（上限高，但盲选容易被天敌打穿）；
-/// 4. 其余 -> `MIDDLE`。
+/// 2. `FIRST`：`games >= eligible_median_games` 且 `Q20 >= -2pp` 且 `mu >= 0.49`
+///    —— 盲选安全**且**有主流出场率背书，挡掉「低出场率偷鸡位」的幸存者偏差；
+/// 3. `LAST` 分支 A：`Q80 >= +2.2pp` 且 `Q20 <= -2.2pp`（双向克制波动）；
+/// 4. `LAST` 分支 B：`games < eligible_median_games` 且 `Q80 >= +3pp` 且
+///    `Q80 - Q20 >= 4.5pp`（冷门但上限极高的偷鸡位）；
+/// 5. 其余 -> `MIDDLE`。
+///
+/// 互斥性：分支 A 要求 `Q20 <= -2.2`，`FIRST` 要求 `Q20 >= -2.0`；分支 B 要求
+/// `games < median`，`FIRST` 要求 `games >= median`。两条路径都与 `FIRST` 严格不交。
 ///
 /// **只有 `eligible` 的英雄参与判定**：本图出场够多、且有足够对位边的英雄。
 /// 极冷门英雄（如狙击图上的下水道近战）几乎没有对位样本，一律留在 `MIDDLE`。
 ///
 /// 每个英雄都会输出一条 `debug` 诊断（`--log debug` 可见）：没有画像的英雄
-/// `coverage` / `Q20` / `Q80` 记作 `NaN`，配合 `eligible` 字段就能直接看出
+/// `coverage` / `Q20` / `Q80` 记作 `NaN`，配合 `eligible` / `games` 就能直接看出
 /// 「为什么这个英雄没有顺位标签」。
 fn assign_pick_orders(
     map_name: &str,
     candidates: &mut [DraftCandidate],
     profiles: &HashMap<i64, MatchupProfile>,
 ) {
+    // 主流出场基准：本图合格英雄出场数的中位数
+    let median_games = eligible_median_games(candidates);
+
     for c in candidates.iter_mut() {
         // 默认不下结论：没有画像 / 样本不足 / 覆盖率不够都保持 MIDDLE
         c.stat.pick_order = PickOrder::Middle;
         let mu = c.stat.smoothed_wr;
+        let games = c.stat.games;
+        // 是否具备本图主流出场率背书（没有合格英雄时一律不背书）
+        let mainstream = median_games.is_some_and(|m| games as f64 >= m);
         let p = profiles.get(&c.stat.id);
 
         let order = match p {
             None => PickOrder::Middle,
             Some(_) if !c.eligible => PickOrder::Middle,
             Some(p) if p.coverage < PICK_MIN_MATCHUP_COVERAGE => PickOrder::Middle,
-            Some(p) if p.q20_pp >= FIRST_MIN_Q20_PP && mu >= FIRST_MIN_MU => PickOrder::First,
-            Some(p) if p.q80_pp >= LAST_MIN_Q80_PP && p.q20_pp <= LAST_MAX_Q20_PP => {
+            // 分支 1：盲选安全 + 主流出场率背书
+            Some(p) if mainstream && p.q20_pp >= FIRST_MIN_Q20_PP && mu >= FIRST_MIN_MU => {
+                PickOrder::First
+            }
+            // 分支 2A：双向克制波动
+            Some(p) if p.q80_pp >= LAST_SWING_MIN_Q80_PP && p.q20_pp <= LAST_SWING_MAX_Q20_PP => {
+                PickOrder::Last
+            }
+            // 分支 2B：冷门但上限极高（极差必须够大，避免「只有一点点优势」的冷门位）
+            Some(p)
+                if !mainstream
+                    && p.q80_pp >= LAST_THIN_MIN_Q80_PP
+                    && (p.q80_pp - p.q20_pp) >= LAST_THIN_MIN_SPREAD_PP =>
+            {
                 PickOrder::Last
             }
             Some(_) => PickOrder::Middle,
@@ -1454,8 +1518,11 @@ fn assign_pick_orders(
             map = %map_name,
             hero = %c.stat.name,
             hero_id = c.stat.id,
+            games = games,
+            eligible_median_games = median_games.unwrap_or(f64::NAN),
             mu = mu,
             eligible = c.eligible,
+            mainstream = mainstream,
             coverage = p.map(|p| p.coverage).unwrap_or(f64::NAN),
             q20_pp = p.map(|p| p.q20_pp).unwrap_or(f64::NAN),
             q80_pp = p.map(|p| p.q80_pp).unwrap_or(f64::NAN),
@@ -2927,6 +2994,13 @@ mod tests {
         c
     }
 
+    /// 同上，但指定本图出场数（用于测试「主流出场率背书」与分支 B）。
+    fn cand_games(id: i64, mu: f64, games: u64, q20_pp: f64, q80_pp: f64) -> DraftCandidate {
+        let mut c = cand_with(id, mu, q20_pp, q80_pp);
+        c.stat.games = games;
+        c
+    }
+
     /// `(id, coverage, Q20, Q80)` -> 顺位画像表。
     fn profile_map(specs: &[(i64, f64, f64, f64)]) -> HashMap<i64, MatchupProfile> {
         specs
@@ -3145,7 +3219,7 @@ mod tests {
     }
 
     #[test]
-    fn last_requires_both_upper_tail_and_blind_risk() {
+    fn last_branch_a_uses_relaxed_two_way_threshold() {
         // 上限不够（Q80 = +1pp）-> 不是 LAST
         let mut cands = vec![cand_with(1, 0.52, -5.0, 1.0)];
         let profiles = profile_map(&[(1, 1.0, -5.0, 1.0)]);
@@ -3158,11 +3232,112 @@ mod tests {
         assign_pick_orders("M", &mut cands, &profiles);
         assert_eq!(cands[0].stat.pick_order, PickOrder::First);
 
-        // 两端都满足 -> LAST
-        let mut cands = vec![cand_with(1, 0.52, -3.0, 3.0)];
-        let profiles = profile_map(&[(1, 1.0, -3.0, 3.0)]);
+        // 旧的 ±3.0pp 双尾已放宽到 ±2.2pp：(-2.3, +2.3) 现在必须判 LAST
+        let mut cands = vec![cand_with(1, 0.52, -2.3, 2.3)];
+        let profiles = profile_map(&[(1, 1.0, -2.3, 2.3)]);
+        assign_pick_orders("M", &mut cands, &profiles);
+        assert_eq!(
+            cands[0].stat.pick_order,
+            PickOrder::Last,
+            "BO3 降权后的残差尺度下 ±2.2pp 即视为双向波动"
+        );
+
+        // 边界：Q20 = -2.2 且 Q80 = +2.2 刚好达标
+        let mut cands = vec![cand_with(1, 0.52, -2.2, 2.2)];
+        let profiles = profile_map(&[(1, 1.0, -2.2, 2.2)]);
         assign_pick_orders("M", &mut cands, &profiles);
         assert_eq!(cands[0].stat.pick_order, PickOrder::Last);
+
+        // 边界外侧：Q20 = -2.1 既不满足 FIRST（< -2.0）也不满足分支 A（> -2.2）
+        let mut cands = vec![cand_with(1, 0.52, -2.1, 2.1)];
+        let profiles = profile_map(&[(1, 1.0, -2.1, 2.1)]);
+        assign_pick_orders("M", &mut cands, &profiles);
+        assert_eq!(cands[0].stat.pick_order, PickOrder::Middle);
+    }
+
+    #[test]
+    fn first_requires_mainstream_pick_rate() {
+        // 5 名合格英雄，出场数 100/100/100/40/20 -> 中位数 100
+        let mut cands = vec![
+            cand_games(1, 0.55, 100, 1.0, 1.0),
+            cand_games(2, 0.55, 100, 1.0, 1.0),
+            cand_games(3, 0.55, 100, 1.0, 1.0),
+            cand_games(4, 0.55, 40, 1.0, 1.0),
+            cand_games(5, 0.55, 20, 1.0, 1.0),
+        ];
+        let profiles = profile_map(&[
+            (1, 1.0, 1.0, 1.0),
+            (2, 1.0, 1.0, 1.0),
+            (3, 1.0, 1.0, 1.0),
+            (4, 1.0, 1.0, 1.0),
+            (5, 1.0, 1.0, 1.0),
+        ]);
+        assert_eq!(eligible_median_games(&cands), Some(100.0));
+        assign_pick_orders("M", &mut cands, &profiles);
+
+        // 只有出场数达到中位数的三名英雄拿 FIRST
+        assert_eq!(cands[0].stat.pick_order, PickOrder::First);
+        assert_eq!(cands[1].stat.pick_order, PickOrder::First);
+        assert_eq!(cands[2].stat.pick_order, PickOrder::First);
+        // 低出场率的「偷鸡位」分位数再好也不能冒充万能先手
+        assert_eq!(
+            cands[3].stat.pick_order,
+            PickOrder::Middle,
+            "出场 40 < 中位 100，不得标 FIRST"
+        );
+        assert_eq!(cands[4].stat.pick_order, PickOrder::Middle);
+    }
+
+    #[test]
+    fn last_branch_b_catches_thin_high_ceiling_picks() {
+        // 出场 20 < 中位 100（冷门），Q20 = -1.5 本来够 FIRST 的盲选安全，
+        // 但出场率不背书 -> 走分支 B：Q80 = +3.4、极差 4.9 >= 4.5 -> LAST
+        let mut cands = vec![
+            cand_games(1, 0.55, 100, 1.0, 1.0),
+            cand_games(2, 0.55, 100, 1.0, 1.0),
+            cand_games(3, 0.55, 20, -1.5, 3.4),
+        ];
+        let profiles = profile_map(&[(1, 1.0, 1.0, 1.0), (2, 1.0, 1.0, 1.0), (3, 1.0, -1.5, 3.4)]);
+        assign_pick_orders("M", &mut cands, &profiles);
+        assert_eq!(cands[2].stat.pick_order, PickOrder::Last);
+
+        // 极差不够（3.4 - 0.0 = 3.4 < 4.5）-> 不满足分支 B，回 MIDDLE
+        let mut cands = vec![
+            cand_games(1, 0.55, 100, 1.0, 1.0),
+            cand_games(2, 0.55, 100, 1.0, 1.0),
+            cand_games(3, 0.55, 20, 0.0, 3.4),
+        ];
+        let profiles = profile_map(&[(1, 1.0, 1.0, 1.0), (2, 1.0, 1.0, 1.0), (3, 1.0, 0.0, 3.4)]);
+        assign_pick_orders("M", &mut cands, &profiles);
+        assert_eq!(cands[2].stat.pick_order, PickOrder::Middle);
+
+        // 上限不够（Q80 = +2.9 < 3.0）-> 不满足分支 B
+        let mut cands = vec![
+            cand_games(1, 0.55, 100, 1.0, 1.0),
+            cand_games(2, 0.55, 100, 1.0, 1.0),
+            cand_games(3, 0.55, 20, -1.8, 2.9),
+        ];
+        let profiles = profile_map(&[(1, 1.0, 1.0, 1.0), (2, 1.0, 1.0, 1.0), (3, 1.0, -1.8, 2.9)]);
+        assign_pick_orders("M", &mut cands, &profiles);
+        assert_eq!(cands[2].stat.pick_order, PickOrder::Middle);
+    }
+
+    #[test]
+    fn eligible_median_games_uses_eligible_heroes_only() {
+        // 不合格英雄（10 场）不参与取中位数
+        let mut cands = vec![
+            cand_games(1, 0.55, 200, 0.0, 0.0),
+            cand_games(2, 0.55, 100, 0.0, 0.0),
+            cand_games(3, 0.55, 10, 0.0, 0.0),
+        ];
+        cands[2].eligible = false;
+        // 偶数个取中间两个的均值；这里合格者只有 200 / 100 -> 150
+        assert_eq!(eligible_median_games(&cands), Some(150.0));
+
+        // 没有合格英雄 -> None（任何标签都不会判定）
+        let mut none = vec![cand_games(1, 0.55, 10, 0.0, 0.0)];
+        none[0].eligible = false;
+        assert_eq!(eligible_median_games(&none), None);
     }
 
     #[test]
