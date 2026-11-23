@@ -87,21 +87,25 @@
 //!
 //! ```text
 //! mu_0  = 同模式其他地图的加权胜率 -> 全库（扣除本图）胜率 -> 0.5
-//! mu    = (W* + kappa * mu_0) / (N* + kappa)           // kappa = 40 伪场次
+//! eff   = 0.5 + 0.5 * (mu_0 - 0.5)                     // 先验向 0.5 折半阻尼
+//! mu    = (W* + kappa * eff) / (N* + kappa)            // kappa = 20 伪场次
 //! sigma = sqrt(mu (1 - mu) / (N* + kappa + 1))         // 后验标准差
 //! u     = clamp(ln(share / 本图中位 share) / ln(5), -1, 1)   // 封顶热度项
-//! q     = mu - 0.5 * sigma + 0.01 * u
-//! score = clamp(50 + 50 * tanh((q - 0.5) / 0.15), 0, 100)   // 保留 1 位小数
+//! q     = mu - 0.8 * sigma + 0.025 * u
+//! score = clamp(50 + 50 * tanh((q - 0.48) / 0.12), 0, 100)  // 保留 1 位小数
 //! ```
 //!
 //! * `W*` / `N*` 是该英雄在**本图**的有效胜场 / 有效场次（已含时间衰减与 BO3 降权）；
-//! * `mu_0` 取同模式**其他**地图的加权胜率——本图数据绝不参与自己的先验；
-//! * `50 + 50 * tanh(...)` 把 50 分锚在「胜率 50% 且零不确定性惩罚」的中性点：
-//!   `q = 0.65` ≈ 88 分，`q = 0.35` ≈ 12 分，但两端饱和，极端值之间不会互相放大；
-//! * 后验惩罚 `0.5 * sigma` **取代**旧的冷门硬封顶：样本越薄 `sigma` 越大，
-//!   分数自然被压向中线，而不是被一刀切在 35 分；
-//! * 热度项权重只有 `0.01`，在最陡处（`q = 0.5`）最多也只能贡献 ±3.3 分，
-//!   杜绝旧口径里「出场率单项拉出十几分」的情况。
+//! * `mu_0` 取同模式**其他**地图的加权胜率，再做向 0.5 的折半阻尼——本图数据绝不
+//!   参与自己的先验，外部地图的优势也只按一半计入，避免「别处超神」硬抬本图薄样本；
+//! * `kappa = 20`：BO3 降权后的 `N*` 只有原始场次的一半上下，κ 取 20 才能让
+//!   20 场左右的小样本保持「先验与实测各半」，而不是被先验吞掉；
+//! * `0.8 * sigma` 是后验不确定性惩罚，**取代**旧的冷门硬封顶：样本越薄 `sigma`
+//!   越大，分数自然被压向中线，而不是被一刀切在 35 分；
+//! * `0.025 * u` 是封顶热度项，满格约值 10 分：足够给长期高出场的主力保底，
+//!   又不足以单靠出场率翻盘；
+//! * 标尺中心取 `0.48`、斜率 `0.12`：抵消 `0.8 * sigma` 的恒定偏移，让「50% 胜率
+//!   + 常规样本」的主力落在 55~65 分，两端继续饱和，极端值之间不会互相放大。
 //!
 //! ## 顺位（`pick_order`）
 //!
@@ -158,20 +162,34 @@ use crate::models::output::{
 
 /// 贝叶斯收缩强度 κ（伪场次）：`mu = (W* + κ·mu_0) / (N* + κ)`。
 ///
-/// 同图有效场次不足 κ 时，平滑胜率被明显拉向同模式先验 `mu_0`；
-/// `N* = 40` 时先验与实测各占一半，`N* = 200` 时实测占 5/6。
-const SCORE_KAPPA: f64 = 40.0;
-/// 后验标准差对综合效用的惩罚系数：`q = mu - 0.5 * sigma + ...`。
-const SCORE_SIGMA_PENALTY: f64 = 0.5;
-/// 出场率（热度）项权重。刻意只给 0.01：热度只在同胜率档内做微调，
-/// 不允许像旧 Min–Max 那样把出场率差放大成十几分。
-const SCORE_USE_WEIGHT: f64 = 0.01;
+/// 同图有效场次不足 κ 时，平滑胜率被明显拉向同模式先验 `mu_0`。
+/// 取 `κ = 20`（而非 40）：BO3 降权后的 `N*` 本来就比原始场次小一半以上，
+/// `κ = 40` 会让 20 场左右的小样本几乎完全由先验决定，把「别的地图强」硬抬成本图前排。
+/// 现在 `N* = 20` 时先验与实测各占一半，`N* = 100` 时实测占 5/6。
+const SCORE_KAPPA: f64 = 20.0;
+/// 后验标准差对综合效用的惩罚系数：`q = mu - 0.8 * sigma + ...`。
+///
+/// 从 0.5 提到 0.8：低样本的不确定性必须真的换来分数折让，否则薄样本会靠先验蹭前排。
+const SCORE_SIGMA_PENALTY: f64 = 0.8;
+/// 出场率（热度）项权重。
+///
+/// 0.025 是「主力保底」与「热度不许主导」的折中：在最陡处（`q ≈ 0.48`）满格热度
+/// 约值 10 分，足以让长期高出场的主力不被薄样本反超，又不足以单靠出场率翻盘。
+const SCORE_USE_WEIGHT: f64 = 0.025;
 /// 热度项的归一尺度：槽位占比相对本图中位数差 5 倍即饱和到 ±1。
 const SCORE_USE_LOG_RATIO: f64 = 5.0;
 /// 先验均值 `mu_0` 可用所需的最小有效场次（同模式其他图 / 全库其他图）。
 const SCORE_PRIOR_MIN_EFF_GAMES: f64 = 20.0;
-/// `tanh` 标尺斜率：`q - 0.5` 每偏离 0.15，综合分走 `50*tanh(1) ≈ 38` 分。
-const SCORE_TANH_SCALE: f64 = 0.15;
+/// 先验均值向 0.5 的阻尼系数：`eff_mu_0 = 0.5 + 0.5 * (mu_0 - 0.5)`。
+///
+/// 折半之后，其他地图 60% 的胜率只按 55% 计入先验，70% 只按 60%——
+/// 避免「别的图超神」把本图的低样本英雄直接顶进前排。
+const SCORE_PRIOR_DAMPING: f64 = 0.5;
+/// `tanh` 标尺斜率：`q` 每偏离中心 0.12，综合分走 `50*tanh(1) ≈ 38` 分。
+const SCORE_TANH_SCALE: f64 = 0.12;
+/// `tanh` 标尺中心：从 0.5 下移到 0.48，抵消 `0.8 * sigma` 的恒定偏移，
+/// 让「50% 胜率的常规主力」落在 55~65 分，而不是被压到 40 分上下。
+const SCORE_TANH_CENTER: f64 = 0.48;
 /// 每场 3v3 共 6 个英雄槽位，`use_rate` 合计 ≈ 6。
 const HERO_SLOTS_PER_BATTLE: f64 = 6.0;
 
@@ -1384,6 +1402,9 @@ fn popularity_term(share: f64, median_share: f64) -> f64 {
 /// 本图数据永远不参与自己的先验（`own` 会被扣掉），否则「先验」就退化成本图的
 /// 原始胜率，`kappa` 收缩失去意义。两条外部路径都要求有效场次
 /// `>= SCORE_PRIOR_MIN_EFF_GAMES`，否则视为样本不足继续回退。
+///
+/// 返回值统一做向 0.5 的**折半阻尼**（见 [`damp_prior`]）：外部地图的优势只按一半
+/// 计入先验，防止「别的图 70% 胜率」把本图 20 场的小样本硬顶进前排。
 fn prior_mean(
     id: i64,
     own: &Accum,
@@ -1394,17 +1415,24 @@ fn prior_mean(
         let n = total.games - own.games;
         let w = total.wins - own.wins;
         if n >= SCORE_PRIOR_MIN_EFF_GAMES {
-            return ratio(w, n).clamp(0.0, 1.0);
+            return damp_prior(ratio(w, n).clamp(0.0, 1.0));
         }
     }
     if let Some(total) = global_acc.get(&id) {
         let n = total.games - own.games;
         let w = total.wins - own.wins;
         if n >= SCORE_PRIOR_MIN_EFF_GAMES {
-            return ratio(w, n).clamp(0.0, 1.0);
+            return damp_prior(ratio(w, n).clamp(0.0, 1.0));
         }
     }
     0.5
+}
+
+/// 先验均值向 0.5 折半阻尼：`eff = 0.5 + 0.5 * (mu_0 - 0.5)`。
+///
+/// 阻尼是**单向收紧**：只削弱偏离 0.5 的幅度，不改变方向，也不改变排序。
+fn damp_prior(mu_0: f64) -> f64 {
+    0.5 + SCORE_PRIOR_DAMPING * (mu_0 - 0.5)
 }
 
 /// 贝叶斯平滑胜率与后验标准差：`(mu, sigma)`。
@@ -1429,7 +1457,7 @@ fn smoothed_win_rate(w_star: f64, n_star: f64, mu_0: f64) -> (f64, f64) {
     (mu, var.sqrt())
 }
 
-/// 综合效用 `q = mu - 0.5 * sigma + 0.01 * u`。
+/// 综合效用 `q = mu - 0.8 * sigma + 0.025 * u`。
 ///
 /// 全部输入都是绝对量（胜率、后验标准差、封顶热度偏移），**没有任何逐图
 /// Min–Max 拉伸**，所以同一份表现放在任何地图上都会得到同一个分数。
@@ -1438,15 +1466,16 @@ fn raw_score_of(w_star: f64, n_star: f64, mu_0: f64, u: f64) -> f64 {
     mu - SCORE_SIGMA_PENALTY * sigma + SCORE_USE_WEIGHT * u
 }
 
-/// 固定 `tanh` 标尺：`50 + 50 * tanh((q - 0.5) / 0.15)`，保留 1 位小数。
+/// 固定 `tanh` 标尺：`50 + 50 * tanh((q - 0.48) / 0.12)`，保留 1 位小数。
 ///
-/// 50 分锚定「胜率 50%、无不确定性惩罚」的中性点；两端饱和保证极端值之间
-/// 不会像 Min–Max 那样互相放大。`q = 0.65` ≈ 88 分，`q = 0.35` ≈ 12 分。
+/// 中心取 0.48（而非 0.5）：`0.8 * sigma` 的惩罚是恒定的，若仍以 0.5 为中心，
+/// 「50% 胜率 + 常规样本」会被压到 40 分上下。下移 0.02 后，50% 胜率的常规主力
+/// 落在 55~65 分，薄样本仍被 σ 惩罚拉低，两端继续饱和。
 fn normalize_score(q: f64) -> f64 {
     if !q.is_finite() {
         return 50.0;
     }
-    let score = 50.0 + 50.0 * ((q - 0.5) / SCORE_TANH_SCALE).tanh();
+    let score = 50.0 + 50.0 * ((q - SCORE_TANH_CENTER) / SCORE_TANH_SCALE).tanh();
     round1(score.clamp(0.0, 100.0))
 }
 
@@ -2474,16 +2503,16 @@ mod tests {
         let map = &out.maps[0];
 
         assert_eq!(map.brawlers[0].id, 1);
-        // 固定标尺：30 场全胜 + 无外部先验 -> mu = 50/70，约 92 分，不再被拉成 100
+        // 固定标尺 + κ=20：30 场全胜、无外部先验 -> mu = 40/50，约 99 分
         assert!(
-            map.brawlers[0].score > 85.0 && map.brawlers[0].score < 100.0,
+            map.brawlers[0].score > 90.0 && map.brawlers[0].score < 100.0,
             "30 场全胜应落在高分段但不必等于 100，实际 {}",
             map.brawlers[0].score
         );
         assert!(map.brawlers.windows(2).all(|w| w[0].score >= w[1].score));
-        // 30 场全败：先验 0.5 把 mu 拉到 20/70，约 4 分
+        // 30 场全败：先验 0.5 把 mu 拉到 10/50，再被 σ 惩罚压到接近 0
         assert!(
-            map.brawlers.last().unwrap().score < 10.0,
+            map.brawlers.last().unwrap().score < 5.0,
             "30 场全败应落在低分段，实际 {}",
             map.brawlers.last().unwrap().score
         );
@@ -2570,7 +2599,7 @@ mod tests {
             raw_games: 20,
             raw_wins: 10,
         };
-        // 同模式其他图 60 场 42 胜 -> mu_0 = 0.7
+        // 同模式其他图 60 场 42 胜 -> 原始 0.7，折半阻尼后 0.6
         let mode_acc = HashMap::from([(
             1i64,
             Accum {
@@ -2589,9 +2618,10 @@ mod tests {
                 raw_wins: 120,
             },
         )]);
-        assert!((prior_mean(1, &own, &mode_acc, &global_acc) - 0.7).abs() < 1e-12);
+        assert!((prior_mean(1, &own, &mode_acc, &global_acc) - 0.6).abs() < 1e-12);
 
-        // 同模式其他图只剩 12 场（< 20）-> 回退全库（扣除本图）：110/180
+        // 同模式其他图只剩 12 场（< 20）-> 回退全库（扣除本图）：110/180 = 0.6111，
+        // 同样折半阻尼 -> 0.5 + 0.5 * 0.1111
         let thin_mode = HashMap::from([(
             1i64,
             Accum {
@@ -2602,11 +2632,17 @@ mod tests {
             },
         )]);
         let fallback = prior_mean(1, &own, &thin_mode, &global_acc);
-        assert!((fallback - 110.0 / 180.0).abs() < 1e-12, "实际 {fallback}");
+        let expected = 0.5 + 0.5 * (110.0 / 180.0 - 0.5);
+        assert!((fallback - expected).abs() < 1e-12, "实际 {fallback}");
 
         // 全库也不足 -> 中性 0.5
         let empty: HashMap<i64, Accum> = HashMap::new();
         assert_eq!(prior_mean(9, &own, &empty, &empty), 0.5);
+
+        // 阻尼只收紧幅度、不改方向：0.9 的先验变成 0.7，0.1 变成 0.3
+        assert!((damp_prior(0.9) - 0.7).abs() < 1e-12);
+        assert!((damp_prior(0.1) - 0.3).abs() < 1e-12);
+        assert_eq!(damp_prior(0.5), 0.5);
     }
 
     #[test]
@@ -2619,7 +2655,8 @@ mod tests {
             "同样胜率下，薄样本的综合效用必须更低：tiny={tiny:.4} solid={solid:.4}"
         );
         let (mu, sigma) = smoothed_win_rate(2.0, 2.0, 0.5);
-        assert!((mu - 22.0 / 42.0).abs() < 1e-12, "实际 mu={mu}");
+        // κ = 20：mu = (2 + 10) / 22
+        assert!((mu - 12.0 / 22.0).abs() < 1e-12, "实际 mu={mu}");
         assert!(sigma > 0.07, "2 场样本的后验标准差应明显偏大，实际 {sigma}");
         // 惩罚把薄样本压到标尺中线以下（旧的硬封顶 35 分已被取代）
         assert!(normalize_score(tiny) < 50.0);
@@ -2629,17 +2666,18 @@ mod tests {
     fn score_weights_win_rate_above_popularity() {
         // 热门卡：1000 场 52.8% 胜率、热度项拉满（+1）
         let popular = raw_score_of(528.0, 1000.0, 0.5, 1.0);
-        // 冷门强卡：370 场 56.9% 胜率、热度项触底（-1）
-        let strong = raw_score_of(210.53, 370.0, 0.5, -1.0);
+        // 冷门强卡：370 场 61% 胜率、热度项触底（-1）
+        let strong = raw_score_of(225.7, 370.0, 0.5, -1.0);
         assert!(
             strong > popular,
-            "高胜率冷门卡应压过高出场低胜率卡：strong={strong:.4} popular={popular:.4}"
+            "显著的胜率优势必须压过出场率：strong={strong:.4} popular={popular:.4}"
         );
-        // 热度项权重只有 0.01：拉满与触底的差距不超过 0.02（在 q 上）
+        // 热度项的预算：满格只值 SCORE_USE_WEIGHT（在 q 上），
+        // 约等于 5pp 胜率——能保底主力，但不足以单靠出场率翻盘。
         let neutral = raw_score_of(528.0, 1000.0, 0.5, 0.0);
         assert!(
-            (popular - neutral).abs() <= SCORE_USE_WEIGHT + 1e-12,
-            "热度项不允许主导排序，实际差 {}",
+            (popular - neutral - SCORE_USE_WEIGHT).abs() < 1e-12,
+            "热度项权重应为 {SCORE_USE_WEIGHT}，实际 {}",
             popular - neutral
         );
     }
@@ -2683,7 +2721,28 @@ mod tests {
         let a = normalize_score(raw_score_of(210.53, 370.0, 0.5, 0.0)); // 56.9%
         let b = normalize_score(raw_score_of(528.0, 1000.0, 0.5, 0.0)); // 52.8%
         let gap = a - b;
-        assert!(gap > 0.0 && gap < 20.0, "顶部综合分差应有限，实际 {gap:.1}");
+        assert!(gap > 0.0 && gap < 15.0, "顶部综合分差应有限，实际 {gap:.1}");
+    }
+
+    #[test]
+    fn neutral_win_rate_maps_to_upper_middle_band() {
+        // 标尺中心下移到 0.48 的目的：50% 胜率的常规主力不再被 σ 惩罚压到 40 分
+        let hot = normalize_score(raw_score_of(500.0, 1000.0, 0.5, 1.0));
+        assert!(
+            (55.0..=65.0).contains(&hot),
+            "1000 场 50% 胜率 + 满格热度应落在 55~65，实际 {hot}"
+        );
+        let plain = normalize_score(raw_score_of(500.0, 1000.0, 0.5, 0.0));
+        assert!(
+            (50.0..=56.0).contains(&plain),
+            "同胜率、热度居中应贴近中线，实际 {plain}"
+        );
+        // 同样 50% 胜率的薄样本必须明显更低：σ 惩罚依然生效
+        let thin = normalize_score(raw_score_of(10.0, 20.0, 0.5, 0.0));
+        assert!(
+            thin < plain - 5.0,
+            "薄样本应明显低于常规样本：thin={thin} plain={plain}"
+        );
     }
 
     #[test]
