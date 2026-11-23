@@ -404,17 +404,29 @@ fn mock_then_analyze_produces_valid_meta() {
         }
     }
     assert!(qualified > 0, "应存在合格英雄");
+    // 顺位不再按固定配额（旧的 round(22%)）分配，改为「本图对手出场率加权分位数」：
+    //   FIRST <=> coverage >= 0.70 且 Q20 >= -2pp 且 mu >= 0.49
+    //   LAST  <=> coverage >= 0.70 且 Q80 >= +3pp 且 Q20 <= -3pp
+    // mock 数据（2000 局 / 108 英雄）对位证据稀疏，coverage 普遍不足 0.70，
+    // 按规则一律 MIDDLE，因此 FIRST 占比完全可能是 0——这里不再断言占比区间，
+    // 只守住两条不变量：标签只落在合格英雄上（上面已逐条断言）、标签数量不超上限。
     let first_ratio = first as f64 / qualified as f64;
     let last_ratio = last as f64 / qualified as f64;
     assert!(
-        (0.18..=0.26).contains(&first_ratio),
-        "合格英雄中 FIRST 占比应约 22%，实际 {:.1}%",
+        (0.0..=1.0).contains(&first_ratio),
+        "FIRST 占比必须在 [0, 1]，实际 {:.1}%",
         first_ratio * 100.0
     );
     assert!(
-        last_ratio <= 0.26,
-        "合格英雄中 LAST 占比不应超过 26%，实际 {:.1}%",
+        (0.0..=1.0).contains(&last_ratio),
+        "LAST 占比必须在 [0, 1]，实际 {:.1}%",
         last_ratio * 100.0
+    );
+    assert!(
+        first + last <= qualified,
+        "带标签的英雄数（{}）不能超过合格英雄数（{}）",
+        first + last,
+        qualified
     );
 
     // JSON 序列化 / 反序列化闭环

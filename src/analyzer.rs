@@ -109,12 +109,33 @@
 //!
 //! ## 顺位（`pick_order`）
 //!
+//! 顺位**不再按固定配额**（旧版 `round(22%)`）强行切名额。配额制的问题在于把
+//! 「名额」和「结论」绑死：天敌极多的英雄（如 El Primo）挤不进 `LAST` 名额后，
+//! 会被剩余名额「顺手」塞进 `FIRST`——结论完全反了。现在两个标签各自独立成立：
+//!
+//! ```text
+//! coverage = Σ w_B[有对位数据] / Σ w_B[本图全部对手]      // 对位证据覆盖率
+//! Q20      = 加权 20 分位（delta_pp 升序累计）            // 盲选下限风险
+//! Q80      = 加权 80 分位                                  // 针对选出时的上限红利
+//!
+//! FIRST  <=> coverage >= 0.70 且 Q20 >= -2pp 且 mu >= 0.49
+//! LAST   <=> coverage >= 0.70 且 Q80 >= +3pp 且 Q20 <= -3pp
+//! 其余   =>  MIDDLE
+//! ```
+//!
+//! * `w_B` 是 `B` 在本图的出场权重（`Accum.games`，已含时间衰减与 BO3 降权），
+//!   所以分位数反映的是「盲选时**实际会遇到**的对手」，而不是英雄名册上的均匀抽样；
+//! * 分位数按 `delta_pp(A vs B)` **升序**累计，视角统一到「A 的优势」：查表只存
+//!   规范方向 `lo < hi`，反查 `B < A` 时必须取负号；
+//! * `coverage < 0.70` 视为对位证据不足，直接 `MIDDLE`（不打先手 / 后手标签）；
+//! * 两个标签互斥：`FIRST` 要求 `Q20 >= -2`，`LAST` 要求 `Q20 <= -3`。
+//!
 //! `flex` 的「被康特惩罚」只看**本图**的对位 delta，不用模式级结果：
 //! 同一英雄在草图与开阔图上的克制差异很大，拿模式级最差对位去评一张开阔图，
-//! 会被无关地形的近战克制污染。
+//! 会被无关地形的近战克制污染。`flex` 现在只作诊断字段输出，不再决定顺位。
 //!
 //! 只有 `games >= 20`、`share >= 0.5%` 且有效对位边 `>= 3` 的英雄参与
-//! FIRST / LAST 分位划分；其余一律 `MIDDLE`——避免没有对位样本的冷门英雄
+//! FIRST / LAST 判定；其余一律 `MIDDLE`——避免没有对位样本的冷门英雄
 //! 因为克制方差为 0 而被误标成先手。
 //!
 //! ## 时间衰减
@@ -256,12 +277,19 @@ const MODE_MATCHUP_TOP_K: usize = 12;
 /// 地图级克制每侧（优势 / 劣势）导出条数上限。
 const MAP_MATCHUP_TOP_K: usize = 8;
 
-/// 每个地图上被判为 `FIRST` 的比例（分位分配，保证分布稳定）。
-const FIRST_RATIO: f64 = 0.22;
-/// 每个地图上被判为 `LAST` 的比例上限。
-const LAST_RATIO: f64 = 0.22;
-/// 对位 delta 极差低于该值（pp），视为「没有明显康特关系」，不判 `LAST`。
-const MIN_POLARITY_PP: f64 = 8.0;
+/// 顺位判定的**覆盖率门槛**：有有效对位数据的对手权重，至少占本图对手总权重的该比例。
+///
+/// 低于门槛说明「对位证据不足」——此时分位数只代表少数热门对手，不足以支撑
+/// 先手 / 后手结论，一律留在 `MIDDLE`。
+const PICK_MIN_MATCHUP_COVERAGE: f64 = 0.70;
+/// `FIRST`（盲选安全）的加权 20 分位下限（pp）：盲选遇到常见对手时最多只能微亏。
+const FIRST_MIN_Q20_PP: f64 = -2.0;
+/// `FIRST` 的本图平滑胜率下限：防止弱势英雄靠「打谁都微弱劣势」混进先手。
+const FIRST_MIN_MU: f64 = 0.49;
+/// `LAST`（看阵容反选）的加权 80 分位下限（pp）：必须有足够高的上限红利。
+const LAST_MIN_Q80_PP: f64 = 3.0;
+/// `LAST` 的加权 20 分位上限（pp）：盲选必须真的容易被天敌打穿。
+const LAST_MAX_Q20_PP: f64 = -3.0;
 /// 存在明显劣势对位时的强度惩罚系数。
 const FLEX_PENALTY: f64 = 0.30;
 /// 最差对位 delta 高于该值（pp）不扣分。
@@ -680,13 +708,19 @@ struct Stratum {
     e: f64,
 }
 
-/// 模式内某个英雄的对位画像（单位均为百分点）。
+/// 模式内某个英雄的对位画像（单位均为百分点，除 `coverage`）。
 #[derive(Debug, Clone, Copy)]
 struct MatchupProfile {
-    /// 最差对位 delta（负数 = 被克制）。
+    /// 最差对位 delta（负数 = 被克制）。只服务 `flex` 诊断，口径与旧版一致（展示边）。
     worst_pp: f64,
-    /// 对位 delta 极差。
+    /// 对位 delta 极差（展示边），同样只作诊断。
     spread_pp: f64,
+    /// 对位证据覆盖率：有有效对位数据的对手权重 / 本图对手总权重。
+    coverage: f64,
+    /// 加权 20 分位：盲选遇到常见对手时的下限风险。
+    q20_pp: f64,
+    /// 加权 80 分位：针对选出时的上限红利。
+    q80_pp: f64,
 }
 
 /// 单张地图的中间聚合结果（模式 / 全库汇总与导出都要用）。
@@ -1028,20 +1062,63 @@ fn build_global_matchups(
     out
 }
 
-/// 从一组对位统计中提取每个英雄的对位画像（最差 delta + 极差）。
+/// 从规范方向（`lo < hi`）的查表数据取 `a` 对 `b` 的残差（pp，**正值 = `a` 占优**）。
 ///
-/// 只统计**通过导出门槛**的对位边；不足 [`MIN_MATCHUPS_FOR_PROFILE`] 条边的英雄
-/// 不产生画像（没有画像就不会被判 `LAST`，也不会被「被康特」惩罚扣分）。
+/// 查表只存 `(lo, hi)` 一条、`delta` 属于 `lo`，所以反查 `b < a` 时必须**取负号**：
+/// 否则「A 被 B 克制」会被读成「A 占优」，整条分位数会反掉。
+fn delta_pp_between(a: i64, b: i64, entries: &HashMap<PairKey, DeltaEntry>) -> Option<f64> {
+    if a == b {
+        return None;
+    }
+    if a < b {
+        entries.get(&(a, b)).map(|e| e.delta * 100.0)
+    } else {
+        entries.get(&(b, a)).map(|e| -e.delta * 100.0)
+    }
+}
+
+/// 加权分位数：`sorted` 必须按 `delta_pp` **升序**，权重按累计分布归一化后取第 `q` 分位。
+///
+/// 用「累计权重首次达到 `q·W`」的阶梯口径（nearest-rank），不做线性插值：
+/// 分位数在这里的语义是「盲选时最可能撞上的那档对位」，插值会凭空造出
+/// 不存在的中间值。`q = 0` 取最小值，`q = 1` 取最大值。
+fn weighted_quantile(sorted: &[(f64, f64)], q: f64) -> Option<f64> {
+    let total: f64 = sorted.iter().map(|(_, w)| *w).sum();
+    if sorted.is_empty() || !(total > 0.0) {
+        return None;
+    }
+    let target = q.clamp(0.0, 1.0) * total;
+    let mut acc = 0.0;
+    for (delta, w) in sorted {
+        acc += *w;
+        if acc >= target - 1e-12 {
+            return Some(*delta);
+        }
+    }
+    sorted.last().map(|(delta, _)| *delta)
+}
+
+/// 从本图对位数据提取每个英雄的加权分位画像。
+///
+/// 1. **加权收集**：对每个英雄 `A` 遍历本图其他所有英雄 `B`，取 `delta_pp(A vs B)`
+///    （视角统一到 `A` 的优势，反查取负号）与 `B` 的出场权重 `w_B`；
+/// 2. **覆盖率**：有数据的 `B` 的权重之和 / 本图全部对手权重之和；
+/// 3. **分位数**：有数据的对手按 `delta_pp` 升序、按归一化权重累计，取 Q20 / Q80。
+///
+/// 不足 [`MIN_MATCHUPS_FOR_PROFILE`] 条**展示边**的英雄不产生画像（也就不会拿到
+/// 顺位标签）；`worst_pp` / `spread_pp` 仍走展示口径，与旧版 `flex` 保持一致。
 fn extract_profiles(
-    pairs: &HashMap<PairKey, PairStat>,
-    delta: &HashMap<PairKey, f64>,
+    core: &MapCore,
+    entries: &HashMap<PairKey, DeltaEntry>,
+    display_delta: &HashMap<PairKey, f64>,
 ) -> HashMap<i64, MatchupProfile> {
-    let mut agg: HashMap<i64, (f64, f64, usize)> = HashMap::new();
-    for (from, to) in pairs.keys() {
-        let Some(&d) = delta.get(&(*from, *to)) else {
+    // 展示口径（显著边）的最差 / 最好对位：只服务 `flex` 诊断，不参与分位数。
+    let mut spans: HashMap<i64, (f64, f64, usize)> = HashMap::new();
+    for (from, to) in core.pairs.keys() {
+        let Some(&d) = display_delta.get(&(*from, *to)) else {
             continue;
         };
-        let e = agg
+        let e = spans
             .entry(*from)
             .or_insert((f64::INFINITY, f64::NEG_INFINITY, 0));
         e.0 = e.0.min(d);
@@ -1049,18 +1126,61 @@ fn extract_profiles(
         e.2 += 1;
     }
 
-    agg.into_iter()
-        .filter(|(_, (_, _, count))| *count >= MIN_MATCHUPS_FOR_PROFILE)
-        .map(|(id, (worst, best, _))| {
-            (
-                id,
-                MatchupProfile {
-                    worst_pp: worst,
-                    spread_pp: best - worst,
-                },
-            )
-        })
-        .collect()
+    let mut out: HashMap<i64, MatchupProfile> = HashMap::new();
+    for &a in core.acc.keys() {
+        let Some(&(worst_pp, best_pp, edges)) = spans.get(&a) else {
+            continue;
+        };
+        if edges < MIN_MATCHUPS_FOR_PROFILE {
+            continue;
+        }
+
+        // 1) 加权收集：分母是本图**全部**其他英雄的权重（含没有对位数据的）
+        let mut total_w = 0.0;
+        let mut covered_w = 0.0;
+        let mut dist: Vec<(f64, f64)> = Vec::new();
+        for (&b, acc) in core.acc.iter() {
+            if b == a {
+                continue;
+            }
+            let w = acc.games;
+            if !(w > 0.0) {
+                continue;
+            }
+            total_w += w;
+            if let Some(pp) = delta_pp_between(a, b, entries) {
+                covered_w += w;
+                dist.push((pp, w));
+            }
+        }
+        if !(total_w > 0.0) || dist.is_empty() {
+            continue;
+        }
+
+        // 3) 升序排序（同值按权重降序只为输出稳定，不影响分位结果）
+        dist.sort_by(|x, y| x.0.total_cmp(&y.0).then_with(|| y.1.total_cmp(&x.1)));
+
+        let coverage = (covered_w / total_w).clamp(0.0, 1.0);
+        let (Some(q20_pp), Some(q80_pp)) = (
+            weighted_quantile(&dist, 0.20),
+            weighted_quantile(&dist, 0.80),
+        ) else {
+            continue;
+        };
+
+        out.insert(
+            a,
+            MatchupProfile {
+                worst_pp,
+                spread_pp: best_pp - worst_pp,
+                coverage,
+                q20_pp: round2(q20_pp),
+                q80_pp: round2(q80_pp),
+            },
+        );
+    }
+
+    out
 }
 
 /// 按英雄枚举已导出的克制条目（只保留 `delta` 里存在的边）。
@@ -1173,10 +1293,12 @@ fn build_mode(
 struct DraftCandidate {
     stat: MapBrawlerStat,
     /// 综合强度：平滑胜率减去「被康特」惩罚。
+    ///
+    /// 顺位改由加权分位数判定后，该值只作诊断输出（`--log debug`），不再参与排序。
     flex: f64,
-    /// 本图对位 delta 极差（pp）。
+    /// 本图对位 delta 极差（pp，展示口径），同样只作诊断输出。
     spread_pp: f64,
-    /// 是否有资格参与 FIRST / LAST 分位划分（样本、出场率、对位边数都要够）。
+    /// 是否有资格参与 FIRST / LAST 判定（样本、出场率、对位边数都要够）。
     eligible: bool,
 }
 
@@ -1195,9 +1317,9 @@ fn build_map(
     // 展示列表用（有向镜像 + 显著性过滤）；查表用 entries，互不影响
     let display_delta = mirror_display_deltas(&entries, MAP_MATCHUP_MIN_EFF_SAMPLES);
 
-    // 本图对位画像：顺位判定只看这张图上**显著**的克制关系（口径与 v4 一致，
-    // 不能把均势对位算进来，否则 FIRST / LAST 的分位会被摊平）
-    let map_profiles = extract_profiles(&core.pairs, &display_delta);
+    // 本图对位画像：分位数取自**查表口径**（只按 n_eff 过滤、不按 |delta| 剪枝），
+    // 否则均势对位被删干净、分位数只剩极端值，盲选风险会被系统性低估。
+    let map_profiles = extract_profiles(core, &entries, &display_delta);
 
     // 热度项的基准：本图槽位占比中位数（比均值更抗「一两个超热门英雄」的拖拽）
     let median_share = median_use_share(core);
@@ -1266,7 +1388,7 @@ fn build_map(
         })
         .collect();
 
-    assign_pick_orders(&mut candidates);
+    assign_pick_orders(&core.map_name, &mut candidates, &map_profiles);
 
     let mut brawlers: Vec<MapBrawlerStat> = candidates.into_iter().map(|c| c.stat).collect();
     brawlers.sort_by(|a, b| {
@@ -1287,64 +1409,63 @@ fn build_map(
     }
 }
 
-/// 按分位分配顺位，保证分布稳定，而不是被固定阈值卡成一边倒。
+/// 按「本图对手出场率加权分位数」判定顺位，**不再有固定配额**。
 ///
-/// **只有 `eligible` 的英雄参与划分**：本图出场够多、且有足够对位边的英雄。
-/// 极冷门英雄（如狙击图上的下水道近战）几乎没有对位样本，克制方差会被算成 0，
-/// 旧逻辑会把它们全部误标成 `FIRST`——现在一律留在 `MIDDLE`。
+/// 旧实现按 `round(22%)` 强行切名额：天敌极多的英雄挤不进 `LAST` 名额后会被
+/// 剩余名额「顺手」塞进 `FIRST`，结论直接反了。配额制把「名额」和「结论」绑死，
+/// 而结论应该由分布本身决定。
 ///
-/// 1. `LAST`：合格英雄中对位极差最大的那一批（需达到 `MIN_POLARITY_PP`）；
-/// 2. `FIRST`：合格且未判 `LAST` 的英雄里 `flex` 最高的一批；
-/// 3. 其余（含全部不合格者）`MIDDLE`。
+/// 判定顺序（两个标签互斥，`Q20` 条件相反）：
 ///
-/// 先判 `LAST` 再判 `FIRST`：波动极大的英雄本质上不适合先手。
-fn assign_pick_orders(candidates: &mut [DraftCandidate]) {
-    let n = candidates.len();
-    if n == 0 {
-        return;
-    }
-    let pool: Vec<usize> = (0..n).filter(|&i| candidates[i].eligible).collect();
-    if pool.is_empty() {
-        return; // 全员样本不足：不给任何顺位标签
-    }
-    let m = pool.len();
-    let quota_first = (((m as f64) * FIRST_RATIO).round() as usize).clamp(1, m);
-    let quota_last = (((m as f64) * LAST_RATIO).round() as usize).clamp(1, m);
+/// 1. `coverage < 0.70` -> `MIDDLE`（对位证据不足，不下结论）；
+/// 2. `Q20 >= -2pp` 且 `mu >= 0.49` -> `FIRST`（盲选安全，且本身不是弱势英雄）；
+/// 3. `Q80 >= +3pp` 且 `Q20 <= -3pp` -> `LAST`（上限高，但盲选容易被天敌打穿）；
+/// 4. 其余 -> `MIDDLE`。
+///
+/// **只有 `eligible` 的英雄参与判定**：本图出场够多、且有足够对位边的英雄。
+/// 极冷门英雄（如狙击图上的下水道近战）几乎没有对位样本，一律留在 `MIDDLE`。
+///
+/// 每个英雄都会输出一条 `debug` 诊断（`--log debug` 可见）：没有画像的英雄
+/// `coverage` / `Q20` / `Q80` 记作 `NaN`，配合 `eligible` 字段就能直接看出
+/// 「为什么这个英雄没有顺位标签」。
+fn assign_pick_orders(
+    map_name: &str,
+    candidates: &mut [DraftCandidate],
+    profiles: &HashMap<i64, MatchupProfile>,
+) {
+    for c in candidates.iter_mut() {
+        // 默认不下结论：没有画像 / 样本不足 / 覆盖率不够都保持 MIDDLE
+        c.stat.pick_order = PickOrder::Middle;
+        let mu = c.stat.smoothed_wr;
+        let p = profiles.get(&c.stat.id);
 
-    // 1) LAST：波动大且确有康特关系
-    let mut by_spread = pool.clone();
-    by_spread.sort_by(|&a, &b| {
-        candidates[b]
-            .spread_pp
-            .partial_cmp(&candidates[a].spread_pp)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| candidates[a].stat.id.cmp(&candidates[b].stat.id))
-    });
-    let mut last_taken = 0usize;
-    for &i in &by_spread {
-        if last_taken >= quota_last {
-            break;
-        }
-        if candidates[i].spread_pp >= MIN_POLARITY_PP {
-            candidates[i].stat.pick_order = PickOrder::Last;
-            last_taken += 1;
-        }
-    }
+        let order = match p {
+            None => PickOrder::Middle,
+            Some(_) if !c.eligible => PickOrder::Middle,
+            Some(p) if p.coverage < PICK_MIN_MATCHUP_COVERAGE => PickOrder::Middle,
+            Some(p) if p.q20_pp >= FIRST_MIN_Q20_PP && mu >= FIRST_MIN_MU => PickOrder::First,
+            Some(p) if p.q80_pp >= LAST_MIN_Q80_PP && p.q20_pp <= LAST_MAX_Q20_PP => {
+                PickOrder::Last
+            }
+            Some(_) => PickOrder::Middle,
+        };
 
-    // 2) FIRST：合格且剩余的英雄里强度最高的
-    let mut rest: Vec<usize> = pool
-        .into_iter()
-        .filter(|&i| candidates[i].stat.pick_order == PickOrder::Middle)
-        .collect();
-    rest.sort_by(|&a, &b| {
-        candidates[b]
-            .flex
-            .partial_cmp(&candidates[a].flex)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| candidates[a].stat.id.cmp(&candidates[b].stat.id))
-    });
-    for &i in rest.iter().take(quota_first) {
-        candidates[i].stat.pick_order = PickOrder::First;
+        tracing::debug!(
+            map = %map_name,
+            hero = %c.stat.name,
+            hero_id = c.stat.id,
+            mu = mu,
+            eligible = c.eligible,
+            coverage = p.map(|p| p.coverage).unwrap_or(f64::NAN),
+            q20_pp = p.map(|p| p.q20_pp).unwrap_or(f64::NAN),
+            q80_pp = p.map(|p| p.q80_pp).unwrap_or(f64::NAN),
+            worst_pp = p.map(|p| p.worst_pp).unwrap_or(f64::NAN),
+            spread_pp = c.spread_pp,
+            flex = c.flex,
+            pick_order = order.as_str(),
+        );
+
+        c.stat.pick_order = order;
     }
 }
 
@@ -2745,106 +2866,412 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pick_orders_follow_quota_distribution() {
-        // 10 个候选：2 个高波动、其余平稳 -> LAST 取 2、FIRST 取 2、MIDDLE 6
-        let mut cands: Vec<DraftCandidate> = (0..10)
-            .map(|i| {
-                let (flex, spread) = match i {
-                    0 => (0.55, 40.0),
-                    1 => (0.52, 25.0),
-                    2 => (0.70, 0.0),
-                    3 => (0.65, 1.0),
-                    _ => (0.45, 0.0),
-                };
-                dummy_candidate(i, flex, spread)
+    /// 构造单图核心：`acc` 只给出场权重，`edges` 是展示口径（有向）的对位 delta。
+    ///
+    /// `pairs` 只用来标记「这条对位存在」，因此填一个常量 `PairStat` 即可。
+    fn core_with(
+        acc: &[(i64, f64)],
+        edges: &[((i64, i64), f64)],
+    ) -> (MapCore, HashMap<PairKey, f64>) {
+        let mut acc_map: HashMap<i64, Accum> = HashMap::new();
+        let mut total_weight = 0.0;
+        let mut total_games = 0u64;
+        for (id, w) in acc {
+            acc_map.insert(
+                *id,
+                Accum {
+                    games: *w,
+                    wins: *w / 2.0,
+                    raw_games: *w as u64,
+                    raw_wins: (*w / 2.0) as u64,
+                },
+            );
+            total_weight += *w;
+            total_games += *w as u64;
+        }
+
+        let mut pairs: HashMap<PairKey, PairStat> = HashMap::new();
+        let mut display: HashMap<PairKey, f64> = HashMap::new();
+        for ((from, to), d) in edges {
+            pairs.insert(
+                (*from, *to),
+                PairStat {
+                    n: 40.0,
+                    w: 20.0,
+                    raw_n: 40,
+                },
+            );
+            display.insert((*from, *to), *d);
+        }
+
+        (
+            MapCore {
+                map_name: "M".into(),
+                mode: "brawlBall".into(),
+                total_games,
+                total_weight,
+                acc: acc_map,
+                pairs,
+                excess: HashMap::new(),
+            },
+            display,
+        )
+    }
+
+    /// 构造一个候选英雄（`mu` = 本图平滑胜率，`Q20` / `Q80` 只用于填诊断用的极差）。
+    ///
+    /// 覆盖率不在候选上，它属于画像：见 [`profile_map`]。
+    fn cand_with(id: i64, mu: f64, q20_pp: f64, q80_pp: f64) -> DraftCandidate {
+        let mut c = dummy_candidate(id, mu, q80_pp - q20_pp);
+        c.stat.smoothed_wr = mu;
+        c
+    }
+
+    /// `(id, coverage, Q20, Q80)` -> 顺位画像表。
+    fn profile_map(specs: &[(i64, f64, f64, f64)]) -> HashMap<i64, MatchupProfile> {
+        specs
+            .iter()
+            .map(|(id, coverage, q20, q80)| {
+                (
+                    *id,
+                    MatchupProfile {
+                        worst_pp: q20.min(0.0),
+                        spread_pp: (q80 - q20).max(0.0),
+                        coverage: *coverage,
+                        q20_pp: *q20,
+                        q80_pp: *q80,
+                    },
+                )
             })
-            .collect();
+            .collect()
+    }
 
-        assign_pick_orders(&mut cands);
+    fn assert_pp(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 1e-9,
+            "期望 {expected}pp，实际 {actual}pp"
+        );
+    }
 
-        let count = |p: PickOrder| cands.iter().filter(|c| c.stat.pick_order == p).count();
-        assert_eq!(count(PickOrder::Last), 2, "quota_last = round(10 * 0.22) = 2");
-        assert_eq!(count(PickOrder::First), 2, "quota_first = 2");
-        assert_eq!(count(PickOrder::Middle), 6);
+    // -----------------------------------------------------------------------
+    // 加权分位数
+    // -----------------------------------------------------------------------
 
-        // 波动最大的两个必须是 LAST
-        assert_eq!(cands[0].stat.pick_order, PickOrder::Last);
-        assert_eq!(cands[1].stat.pick_order, PickOrder::Last);
-        // 剩余里 flex 最高的两个是 FIRST
-        assert_eq!(cands[2].stat.pick_order, PickOrder::First);
-        assert_eq!(cands[3].stat.pick_order, PickOrder::First);
+    #[test]
+    fn weighted_quantile_reads_ascending_distribution() {
+        // 升序排列的四档对位：-9 / -1 / +4 / +12
+        let sorted = [(-9.0, 1.0), (-1.0, 1.0), (4.0, 1.0), (12.0, 1.0)];
+
+        // Q20 必须落在**最小**的那档（累计 25% 首次达到 20%），而不是接近中位的那档
+        assert_eq!(weighted_quantile(&sorted, 0.20), Some(-9.0));
+        // Q80：累计到 +4 只有 75% < 80%，继续走到 +12
+        assert_eq!(weighted_quantile(&sorted, 0.80), Some(12.0));
+        assert_eq!(weighted_quantile(&sorted, 0.0), Some(-9.0));
+        assert_eq!(weighted_quantile(&sorted, 1.0), Some(12.0));
+
+        // 权重决定分位落点：最差档只占 10% 权重时，Q20 立刻跳到 -1
+        let skewed = [(-9.0, 1.0), (-1.0, 9.0)];
+        assert_eq!(weighted_quantile(&skewed, 0.20), Some(-1.0));
+        assert_eq!(weighted_quantile(&skewed, 0.05), Some(-9.0));
+
+        // 空分布 / 零权重没有分位数
+        assert_eq!(weighted_quantile(&[], 0.2), None);
+        assert_eq!(weighted_quantile(&[(0.0, 0.0)], 0.2), None);
     }
 
     #[test]
-    fn flat_map_does_not_invent_counter_picks() {
-        // 全部平稳（spread < 8pp）时不应硬凑 LAST，顺位只分 FIRST / MIDDLE
-        let mut cands: Vec<DraftCandidate> = (0..10)
-            .map(|i| dummy_candidate(i, 0.5 - i as f64 * 0.01, 2.0))
+    fn reverse_lookup_negates_delta() {
+        // 查表只存规范方向（a < b），delta 属于较小 ID 的一方
+        let mut entries: HashMap<PairKey, DeltaEntry> = HashMap::new();
+        entries.insert(
+            (2, 5),
+            DeltaEntry {
+                delta: 0.04,
+                eff_n: 30.0,
+            },
+        ); // 2 对 5 占优 4pp
+        entries.insert(
+            (3, 5),
+            DeltaEntry {
+                delta: -0.02,
+                eff_n: 30.0,
+            },
+        ); // 3 对 5 劣势 2pp
+
+        // 正向：视角与规范方向一致，原样返回
+        assert_pp(delta_pp_between(2, 5, &entries).unwrap(), 4.0);
+        // 反向：5 对 2 必须取负号，否则「被克制」会被读成「占优」
+        assert_pp(delta_pp_between(5, 2, &entries).unwrap(), -4.0);
+        // 反向 + 负残差 = 正优势
+        assert_pp(delta_pp_between(5, 3, &entries).unwrap(), 2.0);
+        assert_pp(delta_pp_between(3, 5, &entries).unwrap(), -2.0);
+
+        // 无数据 / 自己对自己
+        assert!(delta_pp_between(5, 6, &entries).is_none());
+        assert!(delta_pp_between(5, 5, &entries).is_none());
+    }
+
+    #[test]
+    fn profiles_sort_ascending_and_use_appearance_weights() {
+        // 英雄 5 面对三名对手：
+        //   对手 2（权重 100）-> 5 被克制 4pp（规范方向是 (2,5) = +4pp，反查取负）
+        //   对手 3（权重 100）-> 5 占优 2pp（规范方向 (3,5) = -2pp，反查取负）
+        //   对手 6（权重 800）-> 5 占优 9pp
+        let (core, display) = core_with(
+            &[(5, 100.0), (2, 100.0), (3, 100.0), (6, 800.0)],
+            &[((5, 2), -4.0), ((5, 3), 2.0), ((5, 6), 9.0)],
+        );
+        let mut entries: HashMap<PairKey, DeltaEntry> = HashMap::new();
+        entries.insert(
+            (2, 5),
+            DeltaEntry {
+                delta: 0.04,
+                eff_n: 30.0,
+            },
+        );
+        entries.insert(
+            (3, 5),
+            DeltaEntry {
+                delta: -0.02,
+                eff_n: 30.0,
+            },
+        );
+        entries.insert(
+            (5, 6),
+            DeltaEntry {
+                delta: 0.09,
+                eff_n: 30.0,
+            },
+        );
+
+        let profiles = extract_profiles(&core, &entries, &display);
+        let p = profiles.get(&5).expect("英雄 5 应有画像");
+
+        // 全覆盖：三个对手都有对位数据
+        assert!((p.coverage - 1.0).abs() < 1e-12, "coverage={}", p.coverage);
+        // 升序：[-4(100), +2(100), +9(800)]，累计 10% / 20% / 100%
+        // Q20 落在 +2（累计 20% 首次达标），Q80 落在 +9
+        assert_pp(p.q20_pp, 2.0);
+        assert_pp(p.q80_pp, 9.0);
+
+        // 同样三档、等权重时 Q20 落到最差档：证明分位数真的按权重走，且是升序取低端
+        let (core_eq, display_eq) = core_with(
+            &[(5, 100.0), (2, 100.0), (3, 100.0), (6, 100.0)],
+            &[((5, 2), -4.0), ((5, 3), 2.0), ((5, 6), 9.0)],
+        );
+        let p_eq = extract_profiles(&core_eq, &entries, &display_eq);
+        let p_eq = p_eq.get(&5).expect("英雄 5 应有画像");
+        assert_pp(p_eq.q20_pp, -4.0);
+        assert_pp(p_eq.q80_pp, 9.0);
+    }
+
+    #[test]
+    fn coverage_counts_only_opponents_with_data() {
+        // 对手 2 有数据（权重 100），对手 7 没有数据（权重 900）
+        let (core, display) = core_with(
+            &[(5, 100.0), (2, 100.0), (7, 900.0)],
+            &[((5, 2), -3.0), ((5, 7), 0.0)],
+        );
+        let mut entries: HashMap<PairKey, DeltaEntry> = HashMap::new();
+        entries.insert(
+            (2, 5),
+            DeltaEntry {
+                delta: 0.03,
+                eff_n: 30.0,
+            },
+        );
+
+        let profiles = extract_profiles(&core, &entries, &display);
+        let p = profiles.get(&5).expect("英雄 5 应有画像");
+        // 100 / (100 + 900) = 0.10，远低于 0.70 门槛
+        assert!((p.coverage - 0.10).abs() < 1e-12, "coverage={}", p.coverage);
+    }
+
+    // -----------------------------------------------------------------------
+    // 顺位标签（无固定配额）
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pick_orders_have_no_fixed_quota() {
+        // 8 名合格英雄全都「盲选安全」：旧配额制只会放 2 个进 FIRST
+        let mut cands: Vec<DraftCandidate> = (0..8)
+            .map(|i| cand_with(i, 0.55, 1.0, 1.0))
             .collect();
-        assign_pick_orders(&mut cands);
+        let profiles = profile_map(&(0..8).map(|i| (i, 1.0, 1.0, 1.0)).collect::<Vec<_>>());
+        assign_pick_orders("M", &mut cands, &profiles);
+        assert_eq!(
+            cands
+                .iter()
+                .filter(|c| c.stat.pick_order == PickOrder::First)
+                .count(),
+            8,
+            "没有配额上限，全部满足条件就该全部标 FIRST"
+        );
+
+        // 反过来：全都「上限高但盲选会被打穿」-> 全部 LAST
+        let mut cands: Vec<DraftCandidate> = (0..8)
+            .map(|i| cand_with(i, 0.55, -6.0, 8.0))
+            .collect();
+        let profiles = profile_map(&(0..8).map(|i| (i, 1.0, -6.0, 8.0)).collect::<Vec<_>>());
+        assign_pick_orders("M", &mut cands, &profiles);
+        assert_eq!(
+            cands
+                .iter()
+                .filter(|c| c.stat.pick_order == PickOrder::Last)
+                .count(),
+            8
+        );
+    }
+
+    #[test]
+    fn first_requires_blind_safety_and_decent_win_rate() {
+        // Q20 达标但胜率不足 0.49：弱势英雄不能靠「打谁都微弱劣势」混进先手
+        let mut cands = vec![cand_with(1, 0.48, 0.0, 0.0)];
+        let profiles = profile_map(&[(1, 1.0, 0.0, 0.0)]);
+        assign_pick_orders("M", &mut cands, &profiles);
+        assert_eq!(cands[0].stat.pick_order, PickOrder::Middle);
+
+        // 刚好过线
+        let mut cands = vec![cand_with(1, 0.49, -2.0, 0.0)];
+        let profiles = profile_map(&[(1, 1.0, -2.0, 0.0)]);
+        assign_pick_orders("M", &mut cands, &profiles);
+        assert_eq!(cands[0].stat.pick_order, PickOrder::First);
+
+        // Q20 略低于 -2pp 就不算盲选安全
+        let mut cands = vec![cand_with(1, 0.60, -2.01, 0.0)];
+        let profiles = profile_map(&[(1, 1.0, -2.01, 0.0)]);
+        assign_pick_orders("M", &mut cands, &profiles);
+        assert_eq!(cands[0].stat.pick_order, PickOrder::Middle);
+    }
+
+    #[test]
+    fn last_requires_both_upper_tail_and_blind_risk() {
+        // 上限不够（Q80 = +1pp）-> 不是 LAST
+        let mut cands = vec![cand_with(1, 0.52, -5.0, 1.0)];
+        let profiles = profile_map(&[(1, 1.0, -5.0, 1.0)]);
+        assign_pick_orders("M", &mut cands, &profiles);
+        assert_eq!(cands[0].stat.pick_order, PickOrder::Middle);
+
+        // 盲选不虚（Q20 = -1pp）但上限极高 -> 是 FIRST，不是 LAST
+        let mut cands = vec![cand_with(1, 0.52, -1.0, 9.0)];
+        let profiles = profile_map(&[(1, 1.0, -1.0, 9.0)]);
+        assign_pick_orders("M", &mut cands, &profiles);
+        assert_eq!(cands[0].stat.pick_order, PickOrder::First);
+
+        // 两端都满足 -> LAST
+        let mut cands = vec![cand_with(1, 0.52, -3.0, 3.0)];
+        let profiles = profile_map(&[(1, 1.0, -3.0, 3.0)]);
+        assign_pick_orders("M", &mut cands, &profiles);
+        assert_eq!(cands[0].stat.pick_order, PickOrder::Last);
+    }
+
+    #[test]
+    fn wide_counter_spread_never_becomes_first() {
+        // El Primo 式画像：天敌极多（Q20 = -8.5pp）但上限也高（Q80 = +14pp）、
+        // 本图胜率还不低。旧配额制会把他挤进 FIRST，新规则必须是 LAST。
+        let mut cands = vec![cand_with(1, 0.55, -8.5, 14.0)];
+        let profiles = profile_map(&[(1, 0.95, -8.5, 14.0)]);
+        assign_pick_orders("M", &mut cands, &profiles);
+        assert_eq!(
+            cands[0].stat.pick_order,
+            PickOrder::Last,
+            "天敌多 + 上限高 = 后手反选，绝不能标成先手"
+        );
+    }
+
+    #[test]
+    fn low_coverage_leaves_middle() {
+        // 证据不足（69%）时不下结论
+        let mut cands = vec![cand_with(1, 0.60, 6.0, 6.0)];
+        let profiles = profile_map(&[(1, 0.69, 6.0, 6.0)]);
+        assign_pick_orders("M", &mut cands, &profiles);
+        assert_eq!(cands[0].stat.pick_order, PickOrder::Middle);
+
+        // 刚好 70% 就参与判定
+        let mut cands = vec![cand_with(1, 0.60, 6.0, 6.0)];
+        let profiles = profile_map(&[(1, 0.70, 6.0, 6.0)]);
+        assign_pick_orders("M", &mut cands, &profiles);
+        assert_eq!(cands[0].stat.pick_order, PickOrder::First);
+    }
+
+    #[test]
+    fn flat_matchups_do_not_invent_counter_picks() {
+        // 全部均势（Q20 = Q80 = 0pp）：盲选安全 -> FIRST，但绝不该出现 LAST
+        let mut cands: Vec<DraftCandidate> = (0..6)
+            .map(|i| cand_with(i, 0.51, 0.0, 0.0))
+            .collect();
+        let profiles = profile_map(&(0..6).map(|i| (i, 1.0, 0.0, 0.0)).collect::<Vec<_>>());
+        assign_pick_orders("M", &mut cands, &profiles);
 
         assert_eq!(
             cands
                 .iter()
                 .filter(|c| c.stat.pick_order == PickOrder::Last)
                 .count(),
-            0
+            0,
+            "没有两极分布就不该硬凑后手"
         );
         assert_eq!(
             cands
                 .iter()
                 .filter(|c| c.stat.pick_order == PickOrder::First)
                 .count(),
-            2
+            6
         );
     }
 
     #[test]
     fn ineligible_heroes_never_get_first_or_last() {
-        // 前 3 个样本不足（eligible=false），即便 flex / 波动最高也不能拿标签
-        let mut cands: Vec<DraftCandidate> = (0..10)
+        // 画像再漂亮，样本 / 出场率不达标也不能拿标签
+        let mut cands: Vec<DraftCandidate> = (0..4)
             .map(|i| {
-                let spread = if i < 3 { 40.0 } else { 20.0 - i as f64 };
-                let mut c = dummy_candidate(i, 0.9 - i as f64 * 0.01, spread);
-                c.eligible = i >= 3;
+                let mut c = cand_with(i, 0.60, 5.0, 9.0);
+                c.eligible = false;
                 c
             })
             .collect();
-        assign_pick_orders(&mut cands);
+        // 第 0 个换成「天敌多」的画像，确保两种结论都被挡掉
+        cands[0] = {
+            let mut c = cand_with(0, 0.60, -9.0, 12.0);
+            c.eligible = false;
+            c
+        };
+        let profiles = profile_map(&[
+            (0, 1.0, -9.0, 12.0),
+            (1, 1.0, 5.0, 9.0),
+            (2, 1.0, 5.0, 9.0),
+            (3, 1.0, 5.0, 9.0),
+        ]);
+        assign_pick_orders("M", &mut cands, &profiles);
 
-        for c in cands.iter().take(3) {
+        for c in &cands {
             assert_eq!(
                 c.stat.pick_order,
                 PickOrder::Middle,
                 "样本不足的英雄禁止标 FIRST / LAST"
             );
         }
-        // 7 个合格英雄：LAST = round(7*0.22) = 2，FIRST = 2
-        assert_eq!(
-            cands
-                .iter()
-                .filter(|c| c.stat.pick_order == PickOrder::Last)
-                .count(),
-            2
-        );
-        assert_eq!(
-            cands
-                .iter()
-                .filter(|c| c.stat.pick_order == PickOrder::First)
-                .count(),
-            2
-        );
+    }
+
+    #[test]
+    fn missing_profile_leaves_middle() {
+        // 合格但完全没有对位画像（冷门英雄）-> MIDDLE
+        let mut cands = vec![cand_with(1, 0.70, 5.0, 9.0)];
+        assign_pick_orders("M", &mut cands, &HashMap::new());
+        assert_eq!(cands[0].stat.pick_order, PickOrder::Middle);
     }
 
     #[test]
     fn pick_order_uses_map_level_counters_not_mode_level() {
         // 同一模式（brawlBall）下的两张图：
-        //   M1：1 号被 2 号完克（0/40）
-        //   M2：1 号全胜（40/40），且没有任何劣势对位
+        //   M1：1 号被 2 号完克（0 胜）
+        //   M2：1 号全胜，且对每个对手都有对位数据
         //
         // 若顺位用模式级克制，1 号会被 M1 的惨败拖累，在 M2 上拿不到先手；
         // 地图级判定下，M1 的克制不该污染 M2。
+        //
+        // 两张图都让 1 号**轮换队友**，保证本图每个其他英雄都与 1 号交过手
+        // （覆盖率门槛要求「有对位数据的对手」占本图对手总权重的 70% 以上）。
         let mut battles = Vec::new();
         for i in 0..40 {
             let mut r = row_at(
@@ -2857,19 +3284,54 @@ mod tests {
             r.battle_hash = format!("m1-{i}");
             battles.push(r);
         }
-        for i in 0..40 {
+        // 10 局换边：1 号与自己的「老队友」10 / 11 交手，覆盖率才能到 100%
+        for i in 0..10 {
+            let mut r = row_at(
+                "M1",
+                "brawlBall",
+                &shift_time((40 + i) as i64 * TEST_STEP_SECS),
+                [2, 10, 11],
+                [1, 12, 13],
+            );
+            r.battle_hash = format!("m1b-{i}");
+            battles.push(r);
+        }
+        // M2：三套阵容轮换，1 号 40 战全胜且与 2/3/4/5/6 都交过手
+        for i in 0..20 {
             let mut r = row_at(
                 "M2",
                 "brawlBall",
                 &shift_time(i as i64 * TEST_STEP_SECS),
-                [1, 5, 6],
-                [4, 14, 15],
+                [1, 2, 3],
+                [4, 5, 6],
             );
-            r.battle_hash = format!("m2-{i}");
+            r.battle_hash = format!("m2a-{i}");
+            battles.push(r);
+        }
+        for i in 0..10 {
+            let mut r = row_at(
+                "M2",
+                "brawlBall",
+                &shift_time((20 + i) as i64 * TEST_STEP_SECS),
+                [1, 4, 5],
+                [2, 3, 6],
+            );
+            r.battle_hash = format!("m2b-{i}");
+            battles.push(r);
+        }
+        for i in 0..10 {
+            let mut r = row_at(
+                "M2",
+                "brawlBall",
+                &shift_time((30 + i) as i64 * TEST_STEP_SECS),
+                [1, 6, 2],
+                [3, 4, 5],
+            );
+            r.battle_hash = format!("m2c-{i}");
             battles.push(r);
         }
 
-        let ids = vec![1, 2, 4, 5, 6, 10, 11, 12, 13, 14, 15];
+        let ids = vec![1, 2, 3, 4, 5, 6, 10, 11, 12, 13];
         let out = analyze(&battles, &dict(&ids), &opts());
 
         let m2 = out.maps.iter().find(|m| m.map_name == "M2").unwrap();
@@ -2892,23 +3354,36 @@ mod tests {
 
     #[test]
     fn counter_pick_brawler_is_marked_last_on_map() {
-        // 1 号稳吃 2 号，却被 3 号、4 号完克：对位画像呈明显两极（极差约 20pp），
-        // 且有 3 条以上显著对位边，应判 LAST（后手康特位）。
+        // 1 号稳吃 2 号 / 14 号，却被 3 号 / 12 号 / 13 号完克：对位画像呈明显两极
+        // （Q20 深负、Q80 为正），应判 LAST（后手康特位）。
+        //
+        // 三套阵容轮换，保证 1 号与本图每个其他英雄都交过手——覆盖率门槛会先
+        // 淘汰「只跟自己队友同队、从没对位过」的数据。
         let mut battles = Vec::new();
         for i in 0..20 {
             let t = shift_time(i as i64 * TEST_STEP_SECS);
 
-            let mut win = row_at("M", "brawlBall", &t, [1, 10, 11], [2, 12, 13]);
+            let mut win = row_at("M", "brawlBall", &t, [1, 12, 13], [2, 3, 14]);
             win.battle_hash = format!("a{i}");
             battles.push(win);
 
-            for (tag, counter) in [("b", 3), ("c", 4)] {
-                let mut lose = row_at("M", "brawlBall", &t, [counter, 12, 13], [1, 10, 11]);
-                lose.battle_hash = format!("{tag}{i}");
-                battles.push(lose);
-            }
+            let mut lose = row_at("M", "brawlBall", &t, [3, 12, 13], [1, 2, 14]);
+            lose.battle_hash = format!("b{i}");
+            battles.push(lose);
         }
-        let ids = vec![1, 2, 3, 4, 10, 11, 12, 13];
+        for i in 0..10 {
+            let mut r = row_at(
+                "M",
+                "brawlBall",
+                &shift_time((20 + i) as i64 * TEST_STEP_SECS),
+                [1, 2, 3],
+                [12, 13, 14],
+            );
+            r.battle_hash = format!("c{i}");
+            battles.push(r);
+        }
+
+        let ids = vec![1, 2, 3, 12, 13, 14];
         let out = analyze(&battles, &dict(&ids), &opts());
         let one = out.maps[0].brawlers.iter().find(|b| b.id == 1).unwrap();
 
