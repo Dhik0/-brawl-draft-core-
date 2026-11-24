@@ -8,3 +8,7 @@
 
 .workbuddy-ai/
 .tmp/
+
+dist/regression_matchups*.json
+
+dist/regression_matchups*.json
