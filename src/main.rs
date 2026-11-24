@@ -6,16 +6,17 @@
 //! * `analyze` —— 聚合统计并导出 `dist/brawl_meta.json`
 //! * `push`    —— 提交并推送导出的 JSON
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use anyhow::{bail, Context, Result};
-use brawl_draft_core::analyzer::{self, analyze, AnalyzeOptions};
+use brawl_draft_core::analyzer::{self, analyze_with_regression, AnalyzeOptions};
 use brawl_draft_core::config::Config;
 use brawl_draft_core::crawler::Crawler;
 use brawl_draft_core::db::{mock, Db, IngestFilter};
 use brawl_draft_core::models::output::{PickOrder, RolesConfig};
 use brawl_draft_core::publisher;
+use brawl_draft_core::regression::RegressionMatchups;
 use clap::{Parser, Subcommand};
 use tracing::info;
 use tracing::level_filters::LevelFilter;
@@ -68,7 +69,12 @@ enum Cmd {
         keep: bool,
     },
     /// 聚合计算并导出 dist/brawl_meta.json
-    Analyze,
+    Analyze {
+        /// 离线回归克制系数文件（如 dist/regression_matchups.json）：
+        /// 传入后用其 delta_pp 替换地图 / 模式 / 全局三层的对位残差
+        #[arg(long, value_name = "PATH")]
+        regression: Option<PathBuf>,
+    },
     /// 提交并推送导出的 JSON 到 Git 远端
     Push {
         /// 自定义提交信息
@@ -110,7 +116,7 @@ fn run(command: Cmd, pretty: bool) -> Result<()> {
             seed_limit,
         } => cmd_crawl(&cfg, limit.unwrap_or(cfg.crawl_limit), seed, seed_limit),
         Cmd::Mock { count, seed, keep } => cmd_mock(&cfg, count, seed, keep),
-        Cmd::Analyze => cmd_analyze(&cfg, pretty),
+        Cmd::Analyze { regression } => cmd_analyze(&cfg, pretty, regression.as_deref()),
         Cmd::Push { message } => cmd_push(&cfg, message.as_deref()),
     }
 }
@@ -194,7 +200,13 @@ fn cmd_mock(cfg: &Config, count: usize, seed: u64, keep: bool) -> Result<()> {
 // analyze
 // ---------------------------------------------------------------------------
 
-fn cmd_analyze(cfg: &Config, pretty: bool) -> Result<()> {
+fn cmd_analyze(cfg: &Config, pretty: bool, regression_path: Option<&Path>) -> Result<()> {
+    // 回归系数必须在读库之前加载：文件坏了要立刻失败，不浪费一轮全库扫描
+    let regression = match regression_path {
+        Some(path) => Some(load_regression(path)?),
+        None => None,
+    };
+
     let db = Db::open(&cfg.database_path)?;
     let battles = db.load_battles()?;
     if battles.is_empty() {
@@ -214,10 +226,19 @@ fn cmd_analyze(cfg: &Config, pretty: bool) -> Result<()> {
         roles,
     };
 
-    let meta = analyze(&battles, &db.brawler_dict()?, &opts);
+    let meta = analyze_with_regression(
+        &battles,
+        &db.brawler_dict()?,
+        &opts,
+        regression.as_ref(),
+    );
     let report = publisher::write_meta(&cfg.dist_path, &meta, pretty)?;
 
     print_tier_audit(&meta);
+
+    if let Some(reg) = &regression {
+        print_regression_audit(reg);
+    }
 
     // BO3 聚簇：同一批 6 人在 10 分钟内连打的小局按 1/k 降权，
     // 因此「原始对局数」与「有效 BP 组数」不是一回事
@@ -350,6 +371,61 @@ fn cmd_analyze(cfg: &Config, pretty: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// 加载离线回归克制系数，并把训练元信息打到终端。
+///
+/// 读取失败、JSON 结构不符、键序非法、`delta_pp` 非有限数一律直接报错退出：
+/// 一份半损坏的回归表会静默污染三层查表，事后无法从导出文件反查。
+fn load_regression(path: &Path) -> Result<RegressionMatchups> {
+    let reg = RegressionMatchups::load(path)?;
+    let meta = &reg.meta;
+
+    println!("回归克制系数：{}", path.display());
+    println!(
+        "  训练时间 {} / 样本 {} 局 / 有效 BO3 簇 {} 个",
+        meta.trained_at, meta.battles, meta.bo3_clusters
+    );
+    println!(
+        "  表规模：全局 {} 条 / 模式 {} 个 / 地图 {} 个",
+        reg.global_len(),
+        reg.mode_count(),
+        reg.map_count()
+    );
+    println!(
+        "  训练口径：半衰期 {:.0} 天 / 贝叶斯先验 m = {:.0} / 主效应 {}",
+        meta.time_decay_half_life_days, meta.bayes_prior_weight, meta.stage1_main_effect
+    );
+    Ok(reg)
+}
+
+/// 打印回归 `delta_pp` 的注入结果：三层命中 / 回退。
+///
+/// 命中 = 该层查表条目用了回归值；回退 = 回归表缺该键（或整层 / 整图缺失），
+/// 沿用 Rust 原计算值。命中率远低于 100% 通常意味着回归表与本地快照不同步。
+fn print_regression_audit(reg: &RegressionMatchups) {
+    let stats = reg.stats();
+
+    println!("回归 delta_pp 注入（命中 = 用回归值 / 回退 = 用 Rust 原值）：");
+    for (label, level) in [
+        ("地图级", stats.map),
+        ("模式级", stats.mode),
+        ("全局级", stats.global),
+    ] {
+        println!(
+            "          {} 命中 {} / 回退 {}（命中率 {:.1}%，共 {} 条）",
+            label,
+            level.hits,
+            level.fallbacks,
+            level.hit_rate(),
+            level.total()
+        );
+    }
+    println!(
+        "          合计 命中 {} / 回退 {}",
+        stats.total_hits(),
+        stats.total_fallbacks()
+    );
 }
 
 /// 打印段位分布与过滤结果。

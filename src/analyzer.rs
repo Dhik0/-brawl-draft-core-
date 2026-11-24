@@ -189,6 +189,7 @@ use crate::models::output::{
     MetaOutput, ModeBrawlerStat, ModeMeta, PickOrder, RolesConfig, TierAudit, TierBucket,
     SCHEMA_VERSION,
 };
+use crate::regression::{RegLevel, RegressionMatchups};
 
 /// 贝叶斯收缩强度 κ（伪场次）：`mu = (W* + κ·mu_0) / (N* + κ)`。
 ///
@@ -338,10 +339,41 @@ pub struct AnalyzeOptions {
 }
 
 /// 对内存中的对局切片执行完整分析。
+///
+/// 纯 Rust 口径：克制残差全部由本地对局统计（Log5 去偏 + 互斥分层平滑）算出。
+/// 需要用离线回归系数替换残差时走 [`analyze_with_regression`]。
 pub fn analyze(
     battles: &[BattleRow],
     brawler_dict: &HashMap<i64, String>,
     opts: &AnalyzeOptions,
+) -> MetaOutput {
+    analyze_with_regression(battles, brawler_dict, opts, None)
+}
+
+/// 与 [`analyze`] 相同，但可注入离线训练得到的 3v3 回归克制系数。
+///
+/// `regression = None` 时行为与 [`analyze`] 完全一致（逐字节相同的导出结果）。
+///
+/// ## 注入点为什么放在「残差层」而不是「导出层」
+///
+/// 三层查表、详情页 Top-K 榜单、`FIRST / LAST` 顺位判定**共用同一份**
+/// [`DeltaEntry`]（规范方向 `lo < hi`，`delta` 是概率残差）：
+///
+/// ```text
+/// map_delta_entries / mode_delta_entries / build_global_matchups
+///   -> entries（delta 已被回归值替换，eff_n 仍是本地口径）
+///      -> to_matchup_table        查表（三层）
+///      -> mirror_display_deltas   详情页 brawlers[].matchups
+///      -> extract_profiles        Q20 / Q80 -> 顺位标签
+/// ```
+///
+/// 在残差层替换一次，四处自动同口径；若改在导出层逐处打补丁，任何一处漏改
+/// 都会让「查表说 A 克制 B、详情页说 B 克制 A」这种反向冲突重新出现。
+pub fn analyze_with_regression(
+    battles: &[BattleRow],
+    brawler_dict: &HashMap<i64, String>,
+    opts: &AnalyzeOptions,
+    regression: Option<&RegressionMatchups>,
 ) -> MetaOutput {
     // 0) 段位审计 + 过滤（不删库内原始数据，只在聚合口径上过滤）
     let tier_audit = build_tier_audit(battles, opts.min_tier);
@@ -418,6 +450,7 @@ pub fn analyze(
                 &global_excess,
                 brawler_dict,
                 opts,
+                regression,
             )
         })
         .collect();
@@ -444,6 +477,7 @@ pub fn analyze(
                 &global_excess,
                 brawler_dict,
                 opts,
+                regression,
             )
         })
         .collect();
@@ -454,7 +488,7 @@ pub fn analyze(
     });
 
     // 6) 全局 1v1 兜底表（第三层）：全库去偏残差，不按 |delta| 剪枝
-    let global_matchups = build_global_matchups(&global_excess, opts.matchup_prior_k);
+    let global_matchups = build_global_matchups(&global_excess, opts.matchup_prior_k, regression);
 
     MetaOutput {
         schema_version: SCHEMA_VERSION,
@@ -949,12 +983,16 @@ struct DeltaEntry {
 /// 关键：这里**不看 `|delta|`**。旧实现同时删掉 `|delta| < 1.5pp` 的均势对位，
 /// 结果 3×3 表里「五五开」被当成「无数据」，前端回退到模式 / 全局层，
 /// 样本口径一变符号就可能反。查表层必须把均势对位原样留下。
+///
+/// 传入 `regression` 时，**只替换 `delta`**：`eff_n` 与 `n_eff >= 5.0` 的门槛
+/// 仍由本地数据决定，回归表里那些本地没样本的对位不会因此被带出来。
 fn map_delta_entries(
     core: &MapCore,
     mode_idx: usize,
     mode_excess: &HashMap<ModePairKey, Stratum>,
     global_excess: &HashMap<PairKey, Stratum>,
     k: f64,
+    regression: Option<&RegressionMatchups>,
 ) -> HashMap<PairKey, DeltaEntry> {
     let mut out: HashMap<PairKey, DeltaEntry> = HashMap::with_capacity(core.excess.len());
 
@@ -975,7 +1013,17 @@ fn map_delta_entries(
         if eff_n < MAP_MATCHUP_TABLE_MIN_EFF {
             continue;
         }
-        out.insert((*lo, *hi), DeltaEntry { delta, eff_n });
+        out.insert(
+            (*lo, *hi),
+            apply_regression(
+                regression,
+                RegLevel::Map,
+                &core.map_name,
+                *lo,
+                *hi,
+                DeltaEntry { delta, eff_n },
+            ),
+        );
     }
 
     out
@@ -985,10 +1033,12 @@ fn map_delta_entries(
 ///
 /// 与地图层一致：**只按查表样本门槛过滤，不按 `|delta|` 剪枝**。
 fn mode_delta_entries(
+    mode: &str,
     mode_idx: usize,
     mode_excess: &HashMap<ModePairKey, Stratum>,
     global_excess: &HashMap<PairKey, Stratum>,
     k: f64,
+    regression: Option<&RegressionMatchups>,
 ) -> HashMap<PairKey, DeltaEntry> {
     let mut out: HashMap<PairKey, DeltaEntry> = HashMap::new();
 
@@ -1009,10 +1059,63 @@ fn mode_delta_entries(
         if eff_n < MODE_MATCHUP_TABLE_MIN_EFF {
             continue;
         }
-        out.insert((*lo, *hi), DeltaEntry { delta, eff_n });
+        out.insert(
+            (*lo, *hi),
+            apply_regression(
+                regression,
+                RegLevel::Mode,
+                mode,
+                *lo,
+                *hi,
+                DeltaEntry { delta, eff_n },
+            ),
+        );
     }
 
     out
+}
+
+/// 把回归 `delta_pp` 注入一条规范方向残差。
+///
+/// * 命中：`delta = delta_pp / 100.0`（概率残差，导出时再 ×100 回到百分点），
+///   `eff_n` 原样保留——回归文件不携带样本量，也无权改变样本门槛；
+/// * 缺失（该层 / 该作用域 / 该对位键不在回归表里）：原值返回并记一次回退。
+///
+/// 计数在这里累加，是因为这里是**每一层每条对位唯一经过的出口**，
+/// 统计口径与导出条目天然一一对应。
+fn apply_regression(
+    regression: Option<&RegressionMatchups>,
+    level: RegLevel,
+    scope: &str,
+    lo: i64,
+    hi: i64,
+    entry: DeltaEntry,
+) -> DeltaEntry {
+    match regression_pp(regression, level, scope, lo, hi) {
+        Some(pp) => DeltaEntry {
+            delta: pp / 100.0,
+            ..entry
+        },
+        None => entry,
+    }
+}
+
+/// 查回归 `delta_pp` 并记一次命中 / 回退；未启用回归时既不查也不计数。
+fn regression_pp(
+    regression: Option<&RegressionMatchups>,
+    level: RegLevel,
+    scope: &str,
+    lo: i64,
+    hi: i64,
+) -> Option<f64> {
+    let reg = regression?;
+    let hit = reg.delta_pp(level, scope, lo, hi);
+    if hit.is_some() {
+        reg.record_hit(level);
+    } else {
+        reg.record_fallback(level);
+    }
+    hit
 }
 
 /// 规范方向的残差 → **展示列表**用的有向查找表（双向镜像 + 显著性过滤）。
@@ -1059,10 +1162,12 @@ fn to_matchup_table(entries: &HashMap<PairKey, DeltaEntry>) -> Vec<MatchupPair> 
 /// * 门槛 `n_eff >= GLOBAL_MATCHUP_TABLE_MIN_EFF`（BO3 降权后的有效样本），
 ///   `delta_pp ≈ 0` 的均势对位也会保留——这正是前端区分「五五开」与「无数据」的依据；
 /// * 收缩口径与地图/模式层一致：`delta = Σe / (n + K)`，保证三层同尺度；
+/// * 传入 `regression` 时只替换 `delta_pp`，`n_eff` 与门槛仍按本地口径；
 /// * 输出按 `(lo, hi)` 排序，保证导出文件稳定可 diff。
 fn build_global_matchups(
     global_excess: &HashMap<PairKey, Stratum>,
     k: f64,
+    regression: Option<&RegressionMatchups>,
 ) -> Vec<MatchupPair> {
     let mut out: Vec<MatchupPair> = global_excess
         .iter()
@@ -1070,7 +1175,9 @@ fn build_global_matchups(
             if s.n < GLOBAL_MATCHUP_TABLE_MIN_EFF {
                 return None;
             }
-            let delta_pp = round2(s.e / (s.n + k.max(0.0)) * 100.0);
+            let rust_pp = round2(s.e / (s.n + k.max(0.0)) * 100.0);
+            let delta_pp =
+                regression_pp(regression, RegLevel::Global, "", *lo, *hi).unwrap_or(rust_pp);
             Some(MatchupPair::canonical(*lo, *hi, delta_pp, round1(s.n)))
         })
         .collect();
@@ -1234,6 +1341,7 @@ fn build_mode(
     global_excess: &HashMap<PairKey, Stratum>,
     dict: &HashMap<i64, String>,
     opts: &AnalyzeOptions,
+    regression: Option<&RegressionMatchups>,
 ) -> ModeMeta {
     // 每场对局只属于一张图，所以模式层的累加就是各图累加之和
     let mut acc: HashMap<i64, Accum> = HashMap::new();
@@ -1253,7 +1361,14 @@ fn build_mode(
     }
 
     // 规范方向残差：查表用（只按 n_eff 过滤，均势对位保留）
-    let entries = mode_delta_entries(mode_idx, mode_excess, global_excess, opts.matchup_prior_k);
+    let entries = mode_delta_entries(
+        mode,
+        mode_idx,
+        mode_excess,
+        global_excess,
+        opts.matchup_prior_k,
+        regression,
+    );
     // 展示列表用（有向镜像 + 显著性过滤），与查表互不影响
     let display_delta = mirror_display_deltas(&entries, MODE_MATCHUP_MIN_EFF_SAMPLES);
 
@@ -1327,9 +1442,18 @@ fn build_map(
     global_excess: &HashMap<PairKey, Stratum>,
     dict: &HashMap<i64, String>,
     opts: &AnalyzeOptions,
+    regression: Option<&RegressionMatchups>,
 ) -> MapMeta {
     // 本图 delta：本图残差为主，同模式 / 其他模式按互斥权重做先验
-    let entries = map_delta_entries(core, mode_idx, mode_excess, global_excess, opts.matchup_prior_k);
+    // （传入回归表时 delta 已被替换，eff_n 与门槛仍是本地口径）
+    let entries = map_delta_entries(
+        core,
+        mode_idx,
+        mode_excess,
+        global_excess,
+        opts.matchup_prior_k,
+        regression,
+    );
     // 展示列表用（有向镜像 + 显著性过滤）；查表用 entries，互不影响
     let display_delta = mirror_display_deltas(&entries, MAP_MATCHUP_MIN_EFF_SAMPLES);
 
@@ -2100,7 +2224,7 @@ mod tests {
         // 恰好过门槛：n_eff = 6.0 -> 保留（边界必须闭合）
         excess.insert((2, 4), Stratum { n: 6.0, e: 0.0 });
 
-        let out = build_global_matchups(&excess, MATCHUP_PRIOR_K);
+        let out = build_global_matchups(&excess, MATCHUP_PRIOR_K, None);
         assert_eq!(out.len(), 3, "n_eff < 6.0 的条目必须被丢弃，均势对位必须保留");
 
         // 按 (a, b) 升序，且恒有 a < b、无重复
@@ -3808,5 +3932,230 @@ mod tests {
         assert!(out.global_matchups.is_empty());
         assert_eq!(out.total_battles, 0);
         assert_eq!(out.tier_audit.battles_total, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // 离线回归克制系数注入（analyze --regression）
+    // -----------------------------------------------------------------------
+
+    /// 构造一份回归系数文件（`meta` 字段填占位值，测试只关心表内容）。
+    fn regression(raw_tables: &str) -> RegressionMatchups {
+        let json = format!(
+            r#"{{"meta":{{"trained_at":"2026-11-24T12:00:00+00:00",
+                          "battles":1000,"bo3_clusters":400}},{raw_tables}}}"#
+        );
+        RegressionMatchups::from_json_str(&json).expect("测试用回归 JSON 必须合法")
+    }
+
+    /// 在查表数组里取 `(a, b)` 一条（不存在返回 None）。
+    fn table_pair(table: &[MatchupPair], a: i64, b: i64) -> Option<MatchupPair> {
+        table.iter().find(|m| m.a == a && m.b == b).copied()
+    }
+
+    #[test]
+    fn regression_replaces_three_levels_and_keeps_local_n_eff() {
+        // 单图数据集：pair (1,2) 在 25 场里稳定出现，三层查表都能过样本门槛
+        let battles = counter_ladder("M", "brawlBall", 25, "reg");
+        let ids = vec![1, 2, 3, 10, 11, 12, 13];
+        let baseline = analyze(&battles, &dict(&ids), &opts());
+
+        let base_map = table_pair(&find_map(&baseline, "M").matchup_table, 1, 2).expect("地图层应有 (1,2)");
+        let base_mode =
+            table_pair(&find_mode(&baseline, "brawlBall").matchup_table, 1, 2).expect("模式层应有 (1,2)");
+        let base_global =
+            table_pair(&baseline.global_matchups, 1, 2).expect("全局层应有 (1,2)");
+
+        let reg = regression(
+            r#""global_matchups":[[1,2,7.77]],
+               "modes":[{"mode":"brawlBall","matchup_table":[[1,2,-6.66]]}],
+               "maps":[{"map_name":"M","mode":"brawlBall","matchup_table":[[1,2,5.55]]}]"#,
+        );
+
+        let out = analyze_with_regression(&battles, &dict(&ids), &opts(), Some(&reg));
+
+        // 三层各自取到自己那一层的回归值（不会串层）
+        let map_pair = table_pair(&find_map(&out, "M").matchup_table, 1, 2).unwrap();
+        let mode_pair = table_pair(&find_mode(&out, "brawlBall").matchup_table, 1, 2).unwrap();
+        let global_pair = table_pair(&out.global_matchups, 1, 2).unwrap();
+
+        assert_eq!(map_pair.delta_pp, 5.55);
+        assert_eq!(mode_pair.delta_pp, -6.66);
+        assert_eq!(global_pair.delta_pp, 7.77);
+
+        // n_eff 必须仍是本地口径（回归文件不携带样本量）
+        assert_eq!(map_pair.n_eff, base_map.n_eff, "地图层 n_eff 不得被回归文件改写");
+        assert_eq!(mode_pair.n_eff, base_mode.n_eff, "模式层 n_eff 不得被回归文件改写");
+        assert_eq!(global_pair.n_eff, base_global.n_eff, "全局层 n_eff 不得被回归文件改写");
+
+        // 三层全部命中 (1,2)；同一张表里的其他对位不在回归文件中，记为回退
+        let stats = reg.stats();
+        assert_eq!(stats.map.hits, 1);
+        assert_eq!(stats.mode.hits, 1);
+        assert_eq!(stats.global.hits, 1);
+        assert!(stats.map.total() > 1, "地图层应还有其他回退条目");
+        assert_eq!(stats.total_hits(), 3);
+    }
+
+    #[test]
+    fn regression_never_resurrects_low_sample_pairs() {
+        // 只有 3 场：地图 3 < 5、模式 3 < 8、全局 3 < 6，三层都该被样本门槛拦住
+        let battles = battles_with("M", "brawlBall", [1, 10, 11], [2, 12, 13], 3);
+        let ids = vec![1, 2, 10, 11, 12, 13];
+
+        let reg = regression(
+            r#""global_matchups":[[1,2,9.99]],
+               "modes":[{"mode":"brawlBall","matchup_table":[[1,2,9.99]]}],
+               "maps":[{"map_name":"M","matchup_table":[[1,2,9.99]]}]"#,
+        );
+
+        let out = analyze_with_regression(&battles, &dict(&ids), &opts(), Some(&reg));
+
+        assert!(
+            table_pair(&find_map(&out, "M").matchup_table, 1, 2).is_none(),
+            "低样本对位不得因为回归表里有值就被带出（地图层）"
+        );
+        assert!(
+            table_pair(&find_mode(&out, "brawlBall").matchup_table, 1, 2).is_none(),
+            "低样本对位不得因为回归表里有值就被带出（模式层）"
+        );
+        assert!(
+            table_pair(&out.global_matchups, 1, 2).is_none(),
+            "低样本对位不得因为回归表里有值就被带出（全局层）"
+        );
+        // 没有任何条目过门槛，所以也不会产生命中
+        assert_eq!(reg.stats().total_hits(), 0);
+    }
+
+    #[test]
+    fn missing_regression_key_falls_back_to_rust_delta() {
+        let battles = counter_ladder("M", "brawlBall", 25, "fb");
+        let ids = vec![1, 2, 3, 10, 11, 12, 13];
+        let baseline = analyze(&battles, &dict(&ids), &opts());
+        let base_map = table_pair(&find_map(&baseline, "M").matchup_table, 1, 2).unwrap();
+
+        // 回归表只有全局层：地图层整层缺失 -> 必须原样回退
+        let reg = regression(r#""global_matchups":[[1,2,-3.21]]"#);
+        let out = analyze_with_regression(&battles, &dict(&ids), &opts(), Some(&reg));
+
+        let map_pair = table_pair(&find_map(&out, "M").matchup_table, 1, 2).unwrap();
+        assert_eq!(map_pair.delta_pp, base_map.delta_pp, "缺失键必须回退 Rust 原值");
+        assert_eq!(map_pair.n_eff, base_map.n_eff);
+
+        let stats = reg.stats();
+        assert_eq!(stats.map.hits, 0);
+        assert!(stats.map.fallbacks > 0, "地图层应记回退");
+        assert_eq!(stats.mode.hits, 0);
+        assert!(stats.mode.fallbacks > 0, "模式层应记回退");
+        assert_eq!(stats.global.hits, 1, "只有 (1,2) 在回归表里");
+        assert!(stats.global.fallbacks > 0, "全局层其余对位应回退");
+    }
+
+    #[test]
+    fn regression_delta_drives_quantiles_and_pick_order() {
+        // 手工构造单图核心：hero 1 面对 2 / 3 / 4，本地残差全为 0
+        let mut acc: HashMap<i64, Accum> = HashMap::new();
+        for (id, games) in [(1, 60.0), (2, 40.0), (3, 30.0), (4, 20.0)] {
+            acc.insert(
+                id,
+                Accum {
+                    games,
+                    wins: games / 2.0,
+                    raw_games: games as u64,
+                    raw_wins: (games / 2.0) as u64,
+                },
+            );
+        }
+        let mut pairs: HashMap<PairKey, PairStat> = HashMap::new();
+        let mut excess: HashMap<PairKey, Stratum> = HashMap::new();
+        for opp in [2, 3, 4] {
+            pairs.insert(
+                (1, opp),
+                PairStat {
+                    n: 30.0,
+                    w: 15.0,
+                    raw_n: 30,
+                },
+            );
+            pairs.insert(
+                (opp, 1),
+                PairStat {
+                    n: 30.0,
+                    w: 15.0,
+                    raw_n: 30,
+                },
+            );
+            // e = 0 -> 本地残差恰好 0，全部结论只能来自回归表
+            excess.insert((1, opp), Stratum { n: 30.0, e: 0.0 });
+        }
+        let core = MapCore {
+            map_name: "M".into(),
+            mode: "brawlBall".into(),
+            total_games: 150,
+            total_weight: 150.0,
+            acc,
+            pairs,
+            excess,
+        };
+        let empty: HashMap<ModePairKey, Stratum> = HashMap::new();
+        let empty_global: HashMap<PairKey, Stratum> = HashMap::new();
+
+        // 未注入回归：本地残差全 0 -> 展示边为空 -> 没有画像 -> MIDDLE
+        let plain = map_delta_entries(&core, 0, &empty, &empty_global, MATCHUP_PRIOR_K, None);
+        let plain_display = mirror_display_deltas(&plain, MAP_MATCHUP_MIN_EFF_SAMPLES);
+        let plain_profiles = extract_profiles(&core, &plain, &plain_display);
+        let mut plain_candidates = vec![dummy_candidate(1, 0.5, 0.0)];
+        assign_pick_orders("M", &mut plain_candidates, &plain_profiles);
+        assert_eq!(plain_candidates[0].stat.pick_order, PickOrder::Middle);
+
+        // 注入回归：+8pp / -8pp / +3pp -> Q20 = -8、Q80 = +8 -> 分支 A 命中 LAST
+        let reg = regression(
+            r#""global_matchups":[[1,2,0.0]],
+               "maps":[{"map_name":"M","matchup_table":[[1,2,8.0],[1,3,-8.0],[1,4,3.0]]}]"#,
+        );
+        let entries = map_delta_entries(
+            &core,
+            0,
+            &empty,
+            &empty_global,
+            MATCHUP_PRIOR_K,
+            Some(&reg),
+        );
+        let display = mirror_display_deltas(&entries, MAP_MATCHUP_MIN_EFF_SAMPLES);
+        let profiles = extract_profiles(&core, &entries, &display);
+
+        let profile = profiles.get(&1).expect("hero 1 应有对位画像");
+        assert!((profile.q20_pp + 8.0).abs() < 1e-9, "Q20 必须取回归值，实际 {}", profile.q20_pp);
+        assert!((profile.q80_pp - 8.0).abs() < 1e-9, "Q80 必须取回归值，实际 {}", profile.q80_pp);
+        assert!((profile.coverage - 1.0).abs() < 1e-9);
+
+        let mut candidates = vec![dummy_candidate(1, 0.5, 0.0)];
+        assign_pick_orders("M", &mut candidates, &profiles);
+        assert_eq!(
+            candidates[0].stat.pick_order,
+            PickOrder::Last,
+            "顺位标签必须由替换后的 Q20 / Q80 决定"
+        );
+    }
+
+    #[test]
+    fn regression_keeps_table_and_display_antisymmetric() {
+        let battles = counter_ladder("M", "brawlBall", 25, "anti");
+        let ids = vec![1, 2, 3, 10, 11, 12, 13];
+        let reg = regression(
+            r#""global_matchups":[[1,2,0.0]],
+               "maps":[{"map_name":"M","matchup_table":[[1,2,5.55]]}]"#,
+        );
+        let out = analyze_with_regression(&battles, &dict(&ids), &opts(), Some(&reg));
+        let map = find_map(&out, "M");
+
+        let table = table_pair(&map.matchup_table, 1, 2).expect("查表应有 (1,2)");
+        assert_eq!(table.delta_pp, 5.55);
+
+        // 详情页两个方向必须与查表严格反对称
+        let from_1 = matchup_on_map(map, 1, 2).expect("hero 1 的展示列表应含对手 2");
+        let from_2 = matchup_on_map(map, 2, 1).expect("hero 2 的展示列表应含对手 1");
+        assert_eq!(from_1.delta, table.delta_pp, "正向必须与查表同值");
+        assert_eq!(from_2.delta, -table.delta_pp, "反向必须严格取负");
+        assert_eq!(from_1.delta, -from_2.delta);
     }
 }
